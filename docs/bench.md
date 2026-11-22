@@ -8,7 +8,7 @@ Bench is RubyGems and Bundler, and OF is Rails. The design is organic-framework-
 
 In this slice: the closed reader, the lock, sources from git and from a path, a fork rebased on its origin, and a
 package's tests run and read. Not yet: the catalogue, versions resolved between packages, `needs` enforced on
-programs (they are shown at install), and the operating-system sandbox around the reader (below, "Not yet").
+programs (they are shown at install).
 
 ## Setting it up
 
@@ -64,6 +64,14 @@ Each takes `--project <folder>` (default: the current folder). `settings`, `hook
 are a framework's, and answer only through one (`of bench …`).
 
 ## The reader
+
+**Two layers.** The outer one is the operating system's: every evaluation starts the Lua process inside bwrap on
+Linux (no network; fresh user, process, mount and IPC namespaces; a read-only root holding the runtime and the
+libraries it loads, nothing else; no environment) or a deny-by-default sandbox-exec profile on macOS (it may run the
+runtime and read the runtime, its libraries and the system's; nothing else). When the outer layer cannot start,
+nothing is evaluated and Bench says so. It cannot start inside an agent session's own sandbox, so an agent session
+evaluates nothing: OF's listener evaluates an organization's files, outside sessions (of_server's decision,
+organic-framework-build message `01a20566-e23c`). The inner layer is the closed environment below.
 
 Every Lua file Bench reads (a Benchfile, a spec, the lock), and every file a framework hands it, is evaluated in a
 closed environment, in a Lua process of its own (`bin/bench_sandbox.lua`, run by `bin/bench.py`):
@@ -129,11 +137,11 @@ Its module may also give `check(project)`, `before(project, package, module, inp
 `METHOD_WORDS` and `HOOK_WORDS`, which `check`, `hook`, `settings` and `read --words method|hook` use. OF's is
 organic-framework's `bin/of_method.py`, set by `of bench`.
 
-## Not yet
+## Not yet tested
 
-The operating-system sandbox around the reader, required before Bench evaluates a file the team did not write
-(of_server's reading, organic-framework-build message `01a20547-5da1`): bwrap on Linux, a deny-by-default
-sandbox-exec profile on macOS. The watch on resident memory reads `ps` on macOS and is tested on Linux only.
+The outer layer's own tests (`OuterLayerTest`) need a machine where bwrap starts: CI (which must run them) and the
+Lab. From an agent session only the refusal is tested. The macOS profile and the watch on resident memory there
+(it reads `ps`) are not tested yet.
 
 ## Code
 

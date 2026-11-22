@@ -43,6 +43,15 @@ WALL_S = 10
 # ends it past the same size (macOS has no address-space limit that holds)
 PROCESS_MB = 256
 WATCH_S = 0.01
+
+# The outer layer (of_server's decision, organic-framework-build message 01a20566-e23c): every evaluation runs the Lua
+# process inside an operating-system sandbox, bwrap on Linux and a deny-by-default sandbox-exec profile on macOS, and
+# nothing is evaluated when it cannot start. Inside an agent session's own sandbox it cannot (nested namespaces are
+# refused), so a session evaluates nothing: OF's listener does it, outside sessions. "off" is for the tests of the
+# in-process layer alone (tests/test_bench.py), set in code, never from the environment.
+OUTER = "required"
+BWRAP = "/usr/bin/bwrap"
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 FILE_MAX = 1024 * 1024          # one Lua source
 SOURCES_MAX = 8 * 1024 * 1024   # all the Lua sources of one package
 
@@ -135,14 +144,57 @@ def lua_lit(v, depth=0):
     raise BenchError(f"a {type(v).__name__} cannot enter the reader")
 
 
+def _libraries(rt):
+    """The files the runtime RT loads to start, as ldd names them, each with its real path: [(path, real path)]."""
+    out = [(rt, os.path.realpath(rt))]
+    r = subprocess.run(["/usr/bin/ldd", rt], capture_output=True, text=True, timeout=10,
+                       env={"PATH": "/usr/bin:/bin", "LANG": "C"})
+    if r.returncode != 0:
+        raise BenchError(f"the outer layer cannot list what {rt} loads: {(r.stderr or r.stdout).strip()[:200]}")
+    for line in r.stdout.splitlines():
+        for m in re.finditer(r"(/[^\s()]+)", line):
+            p = m.group(1)
+            if os.path.exists(p):
+                out.append((p, os.path.realpath(p)))
+    return list(dict.fromkeys(out))
+
+
+def _outer(rt):
+    """The command that starts runtime RT inside the outer layer, or BenchError when this system has none."""
+    if sys.platform.startswith("linux"):
+        if not os.access(BWRAP, os.X_OK):
+            raise BenchError(f"the outer layer needs bwrap ({BWRAP}): install bubblewrap")
+        cmd = [BWRAP, "--unshare-all", "--die-with-parent", "--new-session", "--clearenv",
+               "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "LANG", "C", "--chdir", "/"]
+        for path, real in _libraries(rt):      # a read-only root holding the runtime and its libraries alone
+            cmd += ["--ro-bind", real, path]
+        return cmd + ["--", rt, "-"]
+    if sys.platform == "darwin":
+        if not os.access(SANDBOX_EXEC, os.X_OK):
+            raise BenchError(f"the outer layer needs sandbox-exec ({SANDBOX_EXEC})")
+        real = os.path.realpath(rt)
+        prefix = os.path.dirname(os.path.dirname(real))   # a Homebrew runtime's keg: its lib/ beside its bin/
+        profile = ("(version 1)\n(deny default)\n"
+                   f"(allow process-exec (literal {json.dumps(real)}))\n"
+                   "(allow file-read-metadata)\n"
+                   f"(allow file-read* (literal {json.dumps(real)}) (subpath {json.dumps(prefix + '/lib')})"
+                   ' (subpath "/usr/lib") (subpath "/System/Library") (literal "/dev/null"))\n'
+                   "(allow sysctl-read)\n")
+        return [SANDBOX_EXEC, "-p", profile, real, "-"]
+    raise BenchError(f"no outer layer on {sys.platform}: Bench evaluates only inside bwrap (Linux) or sandbox-exec "
+                     f"(macOS)")
+
+
 def _limits():
-    """Run in the child before it starts Lua: no core file, no file written, no process started, processor time
-    bounded, and on Linux the address space too. A limit that cannot be set fails the start, so nothing is
-    evaluated without it (of_server, message 01a20547-5da1)."""
+    """Run in the child before it starts Lua: no core file, no file written, processor time bounded, on Linux the
+    address space too, and with no outer layer no process started (the outer layer starts one: its sandbox is the
+    bound there). A limit that cannot be set fails the start, so nothing is evaluated without it (of_server, message
+    01a20547-5da1)."""
     import resource
     cpu = WALL_S + 1
-    lims = [(resource.RLIMIT_CORE, 0), (resource.RLIMIT_FSIZE, 0), (resource.RLIMIT_CPU, cpu),
-            (resource.RLIMIT_NPROC, 0)]
+    lims = [(resource.RLIMIT_CORE, 0), (resource.RLIMIT_FSIZE, 0), (resource.RLIMIT_CPU, cpu)]
+    if OUTER == "off":
+        lims.append((resource.RLIMIT_NPROC, 0))
     if sys.platform.startswith("linux"):
         lims.append((resource.RLIMIT_AS, PROCESS_MB << 20))
     for lim, val in lims:
@@ -207,8 +259,10 @@ def evaluate(files, entry, words, *, mode="read", path=None, args=(), name=None,
     with open(SANDBOX, encoding="utf-8") as f:
         program = "local REQ = " + lua_lit(req) + "\n" + f.read()
     wall = wall_s or WALL_S
+    rt = runtime()
+    cmd = [rt, "-"] if OUTER == "off" else _outer(rt)
     try:
-        p = subprocess.Popen([runtime(), "-"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              cwd="/", env={"PATH": "/usr/bin:/bin", "LANG": "C"}, close_fds=True,
                              start_new_session=True, preexec_fn=_limits)
     except (OSError, subprocess.SubprocessError) as e:
@@ -233,6 +287,8 @@ def evaluate(files, entry, words, *, mode="read", path=None, args=(), name=None,
     m = re.search(r"bench-sandbox: stopped: (\w+)", err)
     if m:
         raise Stopped(m.group(1), name)
+    if p.returncode != 0 and OUTER != "off" and not out and ("bwrap:" in err or "sandbox-exec:" in err):
+        raise BenchError(f"{name}: the outer layer did not start, so nothing was evaluated: {err.strip()[-300:]}")
     if p.returncode != 0:
         if p.returncode in (-9, -24, 137, 152) or p.returncode == -getattr(__import__("signal"), "SIGXCPU", 24):
             raise Stopped("time", name)
