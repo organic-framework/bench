@@ -695,9 +695,16 @@ class OuterLayerTest(unittest.TestCase):
             self.skipTest("the outer layer cannot start here (an agent session's sandbox): CI and the Lab run this")
         self.assertEqual(bench.evaluate({"x.lua": "return 1 + 1"}, "x.lua", bench.NO_WORDS)["returned"], 2)
         # each io.open must give nil (nothing there to open); os.execute must not succeed (5.4 says true, 5.1 says 0)
-        for what, lua in {"a file of the machine": 'io.write(tostring(io.open("/etc/passwd")))',
-                          "the home folder": 'io.write(tostring(io.open("/home")))',
-                          "a write": 'io.write(tostring(io.open("/tmp/bench-outer-probe", "w")))'}.items():
+        # files of the machine, of its system data and of its people, on Linux and macOS (of_lab on macOS, message
+        # 01a20573-1c46: a profile that imported bsd.sb read /etc/passwd); a path that does not exist gives nil too
+        machine = ["/etc/passwd", "/etc/hosts", "/private/etc/hosts", "/home", "/Users", "/Users/Shared/.localized",
+                   "/Library/Preferences/.GlobalPreferences.plist", "/private/var/db/.AppleSetupDone",
+                   "/opt/homebrew/etc", "/var/log", "/root"]
+        if os.environ.get("HOME"):
+            machine.append(os.path.join(os.environ["HOME"], ".ssh"))
+        probes = {f"a read of {p}": f'io.write(tostring(io.open("{p}")))' for p in machine}
+        probes["a write"] = 'io.write(tostring(io.open("/tmp/bench-outer-probe", "w")))'
+        for what, lua in probes.items():
             r = self.layer_runs(lua)
             self.assertEqual((r.returncode, r.stdout.strip()), (0, "nil"), f"{what} was reached: {r.stdout!r} {r.stderr!r}")
         r = self.layer_runs('io.write(tostring(os.execute("/bin/sh -c true")))')
