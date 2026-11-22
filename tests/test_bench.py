@@ -437,6 +437,23 @@ class ReaderHostileTest(_EachRuntime):
         finally:
             sys.platform, bench.subprocess.run = saved
 
+    def test_the_watch_counts_a_whole_process_tree(self):
+        # under bwrap the runtime is a grandchild of what bwrap names (of_lab, message 01a2057d-5bde): an outer
+        # process whose child holds the memory is measured as the tree
+        if not sys.platform.startswith("linux"):
+            self.skipTest("the tree is read from /proc")
+        p = subprocess.Popen(["/bin/sh", "-c", 'exec 3<&0; python3 -c "import sys; b = bytearray(80 << 20); '
+                              'b[::4096] = b\\"x\\" * len(b[::4096]); sys.stdout.write(\\"ok\\\\n\\"); '
+                              'sys.stdout.flush(); sys.stdin.read()"; :'],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(p.stdout.readline().strip(), "ok")
+            self.assertLess(bench._rss_kb(p.pid), 20 * 1024)            # the shell itself is small
+            self.assertGreater(bench._tree_rss_kb(p.pid), 70 * 1024)    # its tree holds the 80 MiB
+        finally:
+            p.stdin.close()
+            p.wait(10)
+
     def test_a_limit_that_cannot_be_set_stops_the_start(self):
         saved = bench._limits
         bench._limits = lambda: (_ for _ in ()).throw(OSError("refused"))
