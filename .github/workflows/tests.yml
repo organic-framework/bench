@@ -1,0 +1,23 @@
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      # the reader is checked on every runtime it takes: Lua 5.4, LuaJIT and Lua 5.1; a test that finds none fails
+      - name: Install Lua
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends lua5.4 luajit lua5.1
+      - name: Unit suite
+        env:
+          GIT_CONFIG_GLOBAL: /dev/null
+          BENCH_STATE: ${{ runner.temp }}/bench-state
+        run: PYTHONPATH=bin python3 -m unittest -v tests.test_bench

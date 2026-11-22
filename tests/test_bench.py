@@ -40,6 +40,8 @@ class _EachRuntime(unittest.TestCase):
     def each(self):
         rts = runtimes()
         if not rts:
+            if os.environ.get("CI"):
+                self.fail("no Lua runtime in CI")
             self.skipTest("no Lua runtime on this machine")
         saved = bench.RUNTIMES, bench.RUNTIME_DIRS
         try:
@@ -346,6 +348,71 @@ class ReaderHostileTest(_EachRuntime):
                           'c = table.concat({"a", "b"}, ",") }')
             self.assertEqual(r["returned"], {"s": 'a=3 "b"', "r": "ababab", "c": "a,b"})
 
+    # of_server's reading, message 01a20547-5da1 (2026-11-23)
+    def peak_kb(self):
+        import resource
+        return resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss   # KiB on Linux; the largest child so far
+
+    def test_a_long_concatenation_is_stopped_with_a_bounded_peak(self):
+        many = "..".join(["b"] * 40)
+        for _ in self.each():
+            with self.assertRaises(bench.Stopped) as cm:
+                self.read(f'local b = ("x"):rep(8000000) return {many}', limits={"instructions": 200_000_000})
+            self.assertEqual(cm.exception.reason, "memory")
+        if sys.platform.startswith("linux"):
+            self.assertLess(self.peak_kb(), (bench.PROCESS_MB + 16) * 1024)
+
+    def test_gsub_with_a_number_is_capped(self):
+        self.refused('local s = ("x"):rep(1000000) return s:gsub(".", 123456789012)')
+
+    def test_a_to_be_closed_value_is_not_given(self):
+        self.refused('setmetatable({}, {__close = function() while true do end end}) return 1')
+
+    def test_recursion_through_C_is_an_error_not_a_crash(self):
+        for src in ('local function f(s) return (s:gsub(".", f)) end return f("ab")',
+                    'local function r() return coroutine.wrap(r)() end return r()',
+                    'local function r() return coroutine.resume(coroutine.create(r)) end return r()',
+                    'local function r() return pcall(r) end return r()',
+                    'local t = {3, 1, 2} local function c(a, b) table.sort({2, 1}, c) return a < b end '
+                    'table.sort(t, c) return t'):
+            for _ in self.each():
+                try:     # refused, or caught by the file's own pcall or resume and returned: never a crash
+                    r = self.read(src)
+                    self.assertEqual(r["returned"], True)
+                except bench.BenchError as e:
+                    self.assertIn("nested deeper than", str(e))
+
+    def test_a_reading_holds_no_address(self):
+        for _ in self.each():
+            self.assertEqual(self.read("return tostring({}) .. tostring(type)")["returned"], "tablefunction")
+        self.refused('return string.format("%p", {})')
+
+    def test_a_number_past_2_53_and_a_text_not_utf8_are_refused(self):
+        for src in ("return 2^53", "return -2^63", "return 1e300", "return { [2^63] = 1 }", 'return "\\255"'):
+            self.refused(src)
+        for _ in self.each():
+            self.assertEqual(self.read("return 2^53 - 1")["returned"], 2 ** 53 - 1)
+
+    def test_a_limit_that_cannot_be_set_stops_the_start(self):
+        saved = bench._limits
+        bench._limits = lambda: (_ for _ in ()).throw(OSError("refused"))
+        try:
+            for _ in self.each():
+                with self.assertRaisesRegex(bench.BenchError, "limits could not be set"):
+                    self.read("return 1")
+        finally:
+            bench._limits = saved
+
+    def test_CI_runs_every_runtime(self):
+        # in CI the hostile set must run on Lua 5.4, LuaJIT and Lua 5.1 (of_server, message 01a20547-5da1), never skip
+        if not os.environ.get("CI"):
+            self.skipTest("CI only")
+        self.assertEqual(sorted(os.path.basename(r) for r in runtimes()), ["lua5.1", "lua5.4", "luajit"])
+
+    def test_only_lua_5_1_and_5_4_are_taken(self):
+        for rt in runtimes():
+            self.assertIn(bench._version(rt), ("Lua 5.1", "Lua 5.4"))
+
     def test_a_cycle_or_a_thread_cannot_leave(self):
         for src in ("local t = {} t.t = t return t", "return coroutine.create(function() end)"):
             self.refused(src)
@@ -393,6 +460,8 @@ PKG = {
 class _Project(unittest.TestCase):
     def setUp(self):
         if not runtimes():
+            if os.environ.get("CI"):
+                self.fail("no Lua runtime in CI")
             self.skipTest("no Lua runtime on this machine")
         self.tmp = tempfile.mkdtemp()
         self.state = os.path.join(self.tmp, "state")
