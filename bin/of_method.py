@@ -1,7 +1,7 @@
 """OF's reading of a package (docs/bench.md, "OF's part"; organic-framework-build reports/framework/metamethod,
 10-metamethod-v2.md sections 3 to 6, and 11-first-slice.md parts 4 and 5).
 
-Bench (bin/of_bench.py) knows packages; this module knows what OF writes in them: a method's `main.lua` (modules,
+Bench (bin/bench.py) knows packages; this module knows what OF writes in them: a method's `main.lua` (modules,
 settings, what may be extended), an organization's tuning (`config/settings/<package>.lua`) and its hooks
 (`extensions/<package>/*.lua`). At install it reads them all in Bench's closed reader, refuses a setting of the wrong
 type and a hook on a module that may not be extended, and gives Bench what the lock records. At work it gives a
@@ -11,8 +11,8 @@ package's settings as installed, and calls the organization's hooks before a mod
 import os
 import re
 
-import of_bench
-from of_bench import BenchError
+import bench
+from bench import BenchError
 
 # the words of a method's main.lua and its lib/ files
 METHOD_WORDS = {"decl": ["roles", "subject", "setting", "module", "extendable", "event"],
@@ -39,7 +39,7 @@ def read_method(folder, spec):
     main = spec.get("main") or "main.lua"
     if not os.path.isfile(os.path.join(folder, main)):
         return {"settings": {}, "modules": {}, "extendable": []}
-    r = of_bench.evaluate(of_bench.lua_sources(folder), main, METHOD_WORDS, name=f"{spec['name']}/{main}")
+    r = bench.evaluate(bench.lua_sources(folder), main, METHOD_WORDS, name=f"{spec['name']}/{main}")
     settings, modules, extendable = {}, {}, []
     for d in r["decls"]:
         w, name, body = d.get("word"), d.get("name"), d.get("body")
@@ -129,7 +129,7 @@ def read_settings(project, package, method):
     if not os.path.isfile(p):
         return values, None
     rel = os.path.relpath(p, project)
-    r = of_bench.read_file(p, of_bench.NO_WORDS, name=rel)
+    r = bench.read_file(p, bench.NO_WORDS, name=rel)
     got = r.get("returned")
     if got is None or got == {} or got == []:
         got = {}
@@ -143,7 +143,7 @@ def read_settings(project, package, method):
         if problem:
             raise BenchError(f"{rel}: {k} {problem}")
         values[k] = v
-    return values, of_bench.file_digest(p)
+    return values, bench.file_digest(p)
 
 
 # ---- the organization's hooks ----
@@ -170,8 +170,8 @@ def read_hooks(project, package, method, version):
     out = []
     for p in hook_files(project, package):
         rel = os.path.relpath(p, project).replace(os.sep, "/")
-        r = of_bench.evaluate({"hook.lua": of_bench._read_text(p)}, "hook.lua", HOOK_WORDS, name=rel)
-        digest = of_bench.file_digest(p)
+        r = bench.evaluate({"hook.lua": bench._read_text(p)}, "hook.lua", HOOK_WORDS, name=rel)
+        digest = bench.file_digest(p)
         for i, d in enumerate(r["decls"], 1):
             when, module, body = d.get("word"), d.get("name"), d.get("body") or {}
             if not module:
@@ -213,18 +213,18 @@ def check(project):
     """The organization's settings and hook files that differ from the lock: [(package, path, how)]."""
     project = os.path.abspath(project)
     out = []
-    for name, e in sorted(of_bench.read_lock(project).items()):
+    for name, e in sorted(bench.read_lock(project).items()):
         p = settings_file(project, name)
         rel = os.path.relpath(p, project)
         want = (e.get("settings") or {}).get("digest")
-        have = of_bench.file_digest(p) if os.path.isfile(p) else None
+        have = bench.file_digest(p) if os.path.isfile(p) else None
         if want != have:
             out.append((name, rel, "added since the install" if not want else "removed since the install"
                         if not have else "changed since the install"))
         locked = {h["file"]: h["digest"] for h in e.get("hooks") or []}
-        now = {os.path.relpath(f, project).replace(os.sep, "/"): of_bench.file_digest(f)
+        now = {os.path.relpath(f, project).replace(os.sep, "/"): bench.file_digest(f)
                for f in hook_files(project, name)}
-        for rel, how in of_bench.changed(locked, now):
+        for rel, how in bench.changed(locked, now):
             out.append((name, rel, how + " since the install"))
     return out
 
@@ -232,9 +232,9 @@ def check(project):
 # ---- at work ----
 
 def _entry(project, package):
-    e = of_bench.read_lock(project).get(package)
+    e = bench.read_lock(project).get(package)
     if e is None:
-        raise BenchError(f"{package} is not installed in {project}: run of bench install")
+        raise BenchError(f"{package} is not installed in {project}: run bench install")
     return e
 
 
@@ -245,9 +245,9 @@ def settings(project, package, parsed=True):
     e = _entry(project, package)
     s = e.get("settings") or {}
     p = settings_file(project, package)
-    have = of_bench.file_digest(p) if os.path.isfile(p) else None
+    have = bench.file_digest(p) if os.path.isfile(p) else None
     if have != s.get("digest"):
-        raise BenchError(f"{os.path.relpath(p, project)} changed since the install: run of bench install, which "
+        raise BenchError(f"{os.path.relpath(p, project)} changed since the install: run bench install, which "
                          f"checks it")
     values = dict(s.get("values") or {})
     if parsed:
@@ -299,11 +299,11 @@ def _run_hooks(project, package, when, module, value, ctx):
     for h in hooks:
         p = os.path.join(project, h["file"])
         by = f"{h['file']}: {when} \"{module}\""
-        if not os.path.isfile(p) or of_bench.file_digest(p) != h["digest"]:
-            return {"decision": "stop", "by": by, "reason": f"{h['file']} changed since the install; run of bench "
+        if not os.path.isfile(p) or bench.file_digest(p) != h["digest"]:
+            return {"decision": "stop", "by": by, "reason": f"{h['file']} changed since the install; run bench "
                                                             f"install, which checks it"}
         try:
-            r = of_bench.evaluate({"hook.lua": of_bench._read_text(p)}, "hook.lua", HOOK_WORDS, mode="call",
+            r = bench.evaluate({"hook.lua": bench._read_text(p)}, "hook.lua", HOOK_WORDS, mode="call",
                                   path=h["at"], args=(value, ctx), name=h["file"])
         except BenchError as err:
             return {"decision": "stop", "by": by, "reason": str(err)}
