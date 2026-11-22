@@ -685,6 +685,23 @@ class ForkTest(_Project):
         self.assertTrue(any("git rebase --abort" in x for x in self.logs))
 
 
+CONNECT_PROBE = r"""
+local ok, ffi = pcall(require, "ffi")
+if not ok then io.write("no ffi") return end
+ffi.cdef[[ int socket(int, int, int); int connect(int, const void *, unsigned int); ]]
+local addr = ffi.new("uint8_t[16]")
+if ffi.os == "OSX" then addr[0] = 16; addr[1] = 2 else addr[0] = 2; addr[1] = 0 end
+addr[2], addr[3] = 0x1f, 0x90                       -- port 8080
+addr[4], addr[5], addr[6], addr[7] = 127, 0, 0, 1
+local s = ffi.C.socket(2, 1, 0)                     -- AF_INET, SOCK_STREAM
+if s < 0 then io.write("denied") return end
+local rc = ffi.C.connect(s, addr, 16)
+local e = ffi.errno()
+-- 0: connected; ECONNREFUSED (61 on macOS, 111 on Linux): the network is there and nothing listens
+if rc == 0 or e == 61 or e == 111 then io.write("reached " .. tostring(e)) else io.write("denied") end
+"""
+
+
 class OuterLayerTest(unittest.TestCase):
     """The outer layer (of_server, message 01a20566-e23c): every evaluation inside bwrap (Linux) or sandbox-exec
     (macOS), and nothing evaluated when it cannot start. Where it cannot start (an agent session's sandbox) only the
@@ -740,8 +757,13 @@ class OuterLayerTest(unittest.TestCase):
                    "/Library/Preferences/.GlobalPreferences.plist", "/private/var/db/.AppleSetupDone",
                    "/opt/homebrew/etc", "/var/log", "/root", "/Volumes", "/System/Volumes/Data/Users",
                    "/System/Volumes/Data/private/etc/hosts", "/usr/local/etc"]
-        if os.environ.get("HOME"):
-            machine.append(os.path.join(os.environ["HOME"], ".ssh"))
+        home = os.path.expanduser("~")
+        machine += [os.path.join(home, ".ssh"), os.path.join(home, ".ssh", "known_hosts")]
+        try:   # a real file of the caller's home folder, whatever it holds
+            machine += [os.path.join(home, n) for n in sorted(os.listdir(home))
+                        if os.path.isfile(os.path.join(home, n))][:2]
+        except OSError:
+            pass
         probes = {f"a read of {p}": f'io.write(tostring(io.open("{p}")))' for p in machine}
         probes["a write"] = 'io.write(tostring(io.open("/tmp/bench-outer-probe", "w")))'
         for what, lua in probes.items():
@@ -762,6 +784,11 @@ class OuterLayerTest(unittest.TestCase):
             self.assertEqual(cm.exception.reason, "memory")
         finally:
             bench._limits, bench.PROCESS_MB = saved
+        # no connection to 127.0.0.1 (of_server, message 01a2057b-28d4), tried where the runtime has an FFI (LuaJIT):
+        # a refused connection (nothing listens) would mean the network is there; a denial or no route means it is not
+        r = self.layer_runs(CONNECT_PROBE)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(r.stdout.strip(), ("denied", "no ffi"), f"127.0.0.1 was reached: {r.stdout!r}")
         r = self.layer_runs('io.write(tostring(os.execute("/bin/sh -c true")))')
         self.assertNotIn(r.stdout.strip(), ("true", "0"), f"a program ran inside the outer layer: {r.stderr!r}")
         self.assertFalse(os.path.exists("/tmp/bench-outer-probe"))
