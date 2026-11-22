@@ -51,6 +51,10 @@ WATCH_S = 0.01
 # in-process layer alone (tests/test_bench.py), set in code, never from the environment.
 OUTER = "required"
 BWRAP = "/usr/bin/bwrap"
+# On Linux each evaluation runs in a transient scope of the user's systemd manager, which bounds what no in-process
+# limit can: the number of processes inside bwrap and their memory together (of_server, message 01a20583-01b4)
+SYSTEMD_RUN = "/usr/bin/systemd-run"
+SCOPE = {"TasksMax": "8", "MemoryMax": "512M"}
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 FILE_MAX = 1024 * 1024          # one Lua source
 SOURCES_MAX = 8 * 1024 * 1024   # all the Lua sources of one package
@@ -164,11 +168,17 @@ def _outer(rt):
     if sys.platform.startswith("linux"):
         if not os.access(BWRAP, os.X_OK):
             raise BenchError(f"the outer layer needs bwrap ({BWRAP}): install bubblewrap")
-        cmd = [BWRAP, "--unshare-all", "--die-with-parent", "--new-session", "--clearenv",
+        if not os.access(SYSTEMD_RUN, os.X_OK):
+            raise BenchError(f"the outer layer needs systemd-run ({SYSTEMD_RUN}) for its scope")
+        scope = [SYSTEMD_RUN, "--user", "--scope", "--collect", "--quiet"]
+        for k, v in SCOPE.items():
+            scope += ["-p", f"{k}={v}"]
+        cmd = scope + [BWRAP, "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent",
+                       "--new-session", "--clearenv",
                "--setenv", "PATH", "/usr/bin:/bin", "--setenv", "LANG", "C", "--chdir", "/"]
         for path, real in _libraries(rt):      # a read-only root holding the runtime and its libraries alone
             cmd += ["--ro-bind", real, path]
-        return cmd + ["--", rt, "-"]
+        return cmd + ["--remount-ro", "/", "--", rt, "-"]
     if sys.platform == "darwin":
         if not os.access(SANDBOX_EXEC, os.X_OK):
             raise BenchError(f"the outer layer needs sandbox-exec ({SANDBOX_EXEC})")
@@ -180,9 +190,10 @@ def _outer(rt):
         # machine's data as well (/etc/passwd read under it, message 01a20573-1c46). So after it every place that
         # holds the machine's or its people's data is denied (/Volumes and /System/Volumes/Data reach the whole disk,
         # the users' folders included), then the runtime and its keg's lib/ are allowed back. Later rules win.
-        # of_server accepted this for the round (message 01a2057b-28d4); what bsd.sb still allows (reads of the
-        # system's own files, some Mach services) is the stated residual, until a profile listing only what start-up
-        # needs is traced on Darwin 27.
+        # of_server accepted this for the round (message 01a2057b-28d4). The stated residual, information only: reads
+        # of the system's own files; the user's record through bsd.sb's services (getpwuid); file metadata and sysctl
+        # everywhere; ~/.CFUserTextEncoding, which CoreFoundation reads at every start (of_lab, 01a2057f-d0d2). A
+        # profile listing only what start-up needs comes when it is traced on Darwin 27.
         data = ["/etc", "/private", "/var", "/tmp", "/Users", "/home", "/root", "/Library", "/Applications", "/opt",
                 "/usr/local", "/Volumes", "/System/Volumes/Data", "/Network", "/cores"]
         deny = " ".join(f"(subpath {json.dumps(d)})" for d in data)
@@ -357,12 +368,16 @@ def evaluate(files, entry, words, *, mode="read", path=None, args=(), name=None,
     rt = runtime()
     cmd = [rt, "-"] if OUTER == "off" else _outer(rt)
     status_r = status_w = None
-    if cmd[0] == BWRAP:      # bwrap says the runtime's pid on this pipe, for the memory watch
+    if BWRAP in cmd:      # bwrap says the runtime's pid on this pipe, for the memory watch
         status_r, status_w = os.pipe()
-        cmd = cmd[:1] + ["--json-status-fd", str(status_w)] + cmd[1:]
+        i = cmd.index(BWRAP) + 1
+        cmd = cmd[:i] + ["--json-status-fd", str(status_w)] + cmd[i:]
     try:
+        env = {"PATH": "/usr/bin:/bin", "LANG": "C"}
+        if cmd[0] == SYSTEMD_RUN:   # to reach the user's manager; bwrap clears the environment inside
+            env["XDG_RUNTIME_DIR"] = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             cwd="/", env={"PATH": "/usr/bin:/bin", "LANG": "C"}, close_fds=True,
+                             cwd="/", env=env, close_fds=True,
                              pass_fds=(status_w,) if status_w is not None else (),
                              start_new_session=True, preexec_fn=_limits)
     except (OSError, subprocess.SubprocessError) as e:
@@ -397,7 +412,8 @@ def evaluate(files, entry, words, *, mode="read", path=None, args=(), name=None,
     if m:
         raise Stopped(m.group(1), name)
     if p.returncode != 0 and OUTER != "off" and not out and (
-            "bwrap:" in err or "sandbox-exec:" in err or (p.returncode == -6 and not err.strip())):
+            "bwrap:" in err or "sandbox-exec:" in err or "systemd-run" in err or "scope" in err.lower()
+            or "bus" in err.lower() or (p.returncode == -6 and not err.strip())):
         # an abort with no word, before the runtime wrote anything, is the sandbox refusing the start (macOS)
         raise BenchError(f"{name}: the outer layer did not start, so nothing was evaluated: "
                          f"{err.strip()[-300:] or f'the runtime aborted at its start (exit {p.returncode})'}")

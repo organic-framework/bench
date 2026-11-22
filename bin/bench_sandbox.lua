@@ -23,6 +23,7 @@ local m_floor, m_huge = math.floor, math.huge
 local out, err = io.stdout, io.stderr
 local exit = os.exit
 local sethook = debug.sethook
+local raw_getmetatable = debug.getmetatable   -- the runner's: a protected metatable's __tostring is found as Lua finds it
 local gc = collectgarbage
 local load, loadstring, setfenv = load, rawget(_G, "loadstring"), rawget(_G, "setfenv")
 local co_create, co_resume, co_yield = coroutine.create, coroutine.resume, coroutine.yield
@@ -81,7 +82,7 @@ end
 local function safe_tostring(v)
   local t = type(v)
   if t == "table" or t == "function" or t == "thread" or t == "userdata" then
-    local mt = getmetatable(v)
+    local mt = raw_getmetatable(v)
     local f = type(mt) == "table" and rawget(mt, "__tostring")
     if f then
       local r = f(v)
@@ -294,7 +295,11 @@ end
 -- guarded too); a later change to the table the file passed does not reach the copy.
 local CLOSING = { __gc = true, __close = true }
 local guarded = setmetatable({}, { __mode = "k" })
+-- __metatable = false on the guard and on each copy: getmetatable gives neither out, so neither can be swapped or
+-- cleared (of_server, message 01a20583-01b4: setmetatable(getmetatable(t), nil) took the guard off). The price: a
+-- table's metatable, once set, cannot be read back or set again.
 local GUARD = {
+  __metatable = false,
   __newindex = function(c, k, v)
     if CLOSING[k] then error("setmetatable: " .. k .. " is not given here", 2) end
     rawset(c, k, v)
@@ -307,6 +312,7 @@ local function safe_setmetatable(t, mt)
     if CLOSING[k] then error("setmetatable: __gc and __close are not given here", 2) end
     c[k] = v
   end
+  rawset(c, "__metatable", false)
   setmetatable(c, GUARD)
   guarded[c] = true
   return setmetatable(t, c)
