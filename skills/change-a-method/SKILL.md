@@ -5,7 +5,7 @@ description: Change how a method (a Bench package such as of-asks) works for you
 
 # Change a method for your organization
 
-An organization runs methods as Bench packages listed in its project's `Benchfile` (docs/bench.md). Three ways
+An organization runs methods as Bench packages listed in its project's `Benchfile` (organic-framework's docs/bench.md). Three ways
 change one; take the smallest that does what is wanted:
 
 1. **Tune** a value the package offers: `config/settings/<package>.lua`.
@@ -54,7 +54,11 @@ of bench settings of-asks
 
 The install refuses a wrong type or an unknown name, says which, and writes nothing; fix the file and run it again.
 `of bench settings` prints the values the package now reads (a duration in seconds). Until you run the install, the
-package refuses the changed file, so a value nobody checked never acts.
+package refuses the changed file and keeps its default, so a value nobody checked never acts.
+
+In of-asks, `escalate_after` is when a card routed to a delegated unit's owner, and still unanswered, rises to the
+owner: for a delegation whose `escalate_when` has a bare `ask_unanswered` (with a number, `ask_unanswered > 4h`, the
+rule keeps its own time).
 
 ## 2. Write a hook on one module
 
@@ -82,6 +86,11 @@ before "file" {
   `{ decision = "hold", until = "<event>" }`, with an optional `reason`. Anything else stops the module.
 - `ctx.settings` holds the package's settings; `ctx.package` its name.
 - Several hooks before one module run in file-name order; the first that does not pass decides.
+- In of-asks 1 the hooks called are those `before "file"`; the others are checked at install and not yet called.
+  The card a hook sees: `question`, `options`, `tags` (the tags the asker declared), `tags_guessed` (tags OF only
+  guessed from the words: a guess alone should never stop a card), `to`, `from`, `blocking`, `due`, `task`.
+- When a hook stops a card, `of ask` files nothing, prints the hook (`by`) and its `reason` to the asker, and records
+  `of.ask_stopped`.
 
 Then:
 
@@ -94,8 +103,8 @@ The install refuses a hook on a module that may not be extended, one written for
 without `run`, and says why. To see the hook decide before you rely on it, call it with a sample input:
 
 ```sh
-of bench hook of-asks file --input '{"title": "Pay the invoice?", "tags": ["money"]}'
-of bench hook of-asks file --input '{"title": "Restart the node?", "tags": ["infra"]}'
+of bench hook of-asks file --input '{"question": "Pay the invoice?", "tags": ["money"]}'
+of bench hook of-asks file --input '{"question": "Restart the node?", "tags": ["infra"]}'
 ```
 
 Each prints the decision and the hook that made it (`by`); it exits 0 on "pass" and 2 otherwise. An edited hook stops the module until the next
@@ -132,7 +141,9 @@ of bench rebase of-asks                 # or --onto <tag or branch>
 of bench install
 ```
 
-The rebase puts your commits on the new version and runs the tests again. On a conflict it stops and names the
+The rebase puts your commits on the new version and runs the tests again. The tests are the new version's own
+program, run on this machine outside Bench's reader (Bench says so before it runs them); `of bench rebase of-asks
+--no-tests` rebases without running them, and `of bench test of-asks` runs them when you have read what changed. On a conflict it stops and names the
 files: resolve them in `forks/of-asks`, `git add` them, `git rebase --continue`, then `of bench test of-asks` and
 `of bench install`. `git rebase --abort` goes back to where you were.
 
