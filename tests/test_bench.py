@@ -738,7 +738,8 @@ class OuterLayerTest(unittest.TestCase):
         # 01a20573-1c46: a profile that imported bsd.sb read /etc/passwd); a path that does not exist gives nil too
         machine = ["/etc/passwd", "/etc/hosts", "/private/etc/hosts", "/home", "/Users", "/Users/Shared/.localized",
                    "/Library/Preferences/.GlobalPreferences.plist", "/private/var/db/.AppleSetupDone",
-                   "/opt/homebrew/etc", "/var/log", "/root"]
+                   "/opt/homebrew/etc", "/var/log", "/root", "/Volumes", "/System/Volumes/Data/Users",
+                   "/System/Volumes/Data/private/etc/hosts", "/usr/local/etc"]
         if os.environ.get("HOME"):
             machine.append(os.path.join(os.environ["HOME"], ".ssh"))
         probes = {f"a read of {p}": f'io.write(tostring(io.open("{p}")))' for p in machine}
