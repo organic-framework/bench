@@ -777,8 +777,12 @@ class OuterLayerTest(unittest.TestCase):
         home = os.path.expanduser("~")
         machine += [os.path.join(home, ".ssh"), os.path.join(home, ".ssh", "known_hosts")]
         try:   # a real file of the caller's home folder, whatever it holds
+            # on macOS ~/.CFUserTextEncoding (the user's text-encoding number, a few bytes) stays readable under any
+            # file-read rule of the profile: CoreFoundation reads it at a process's start (of_lab, Darwin 27, message
+            # 01a2057f-d0d2), a stated residual with bsd.sb's; every other file of the home is probed
+            platform_files = {".CFUserTextEncoding"} if sys.platform == "darwin" else set()
             machine += [os.path.join(home, n) for n in sorted(os.listdir(home))
-                        if os.path.isfile(os.path.join(home, n))][:2]
+                        if os.path.isfile(os.path.join(home, n)) and n not in platform_files][:2]
         except OSError:
             pass
         probes = {f"a read of {p}": f'io.write(tostring(io.open("{p}")))' for p in machine}
