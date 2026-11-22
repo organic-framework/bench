@@ -174,7 +174,10 @@ def _outer(rt):
             raise BenchError(f"the outer layer needs sandbox-exec ({SANDBOX_EXEC})")
         real = os.path.realpath(rt)
         prefix = os.path.dirname(os.path.dirname(real))   # a Homebrew runtime's keg: its lib/ beside its bin/
-        profile = ("(version 1)\n(deny default)\n"
+        # bsd.sb first: without it no process starts under deny-default on current macOS (of_lab on Darwin 27, message
+        # 01a2056f-f8fc: SIGABRT before main, /bin/echo too); the deny-default after it and the reads below still
+        # scope files and the network
+        profile = ('(version 1)\n(import "bsd.sb")\n(deny default)\n'
                    f"(allow process-exec (literal {json.dumps(real)}))\n"
                    "(allow file-read-metadata)\n"
                    f"(allow file-read* (literal {json.dumps(real)}) (subpath {json.dumps(prefix + '/lib')})"
@@ -287,8 +290,11 @@ def evaluate(files, entry, words, *, mode="read", path=None, args=(), name=None,
     m = re.search(r"bench-sandbox: stopped: (\w+)", err)
     if m:
         raise Stopped(m.group(1), name)
-    if p.returncode != 0 and OUTER != "off" and not out and ("bwrap:" in err or "sandbox-exec:" in err):
-        raise BenchError(f"{name}: the outer layer did not start, so nothing was evaluated: {err.strip()[-300:]}")
+    if p.returncode != 0 and OUTER != "off" and not out and (
+            "bwrap:" in err or "sandbox-exec:" in err or (p.returncode == -6 and not err.strip())):
+        # an abort with no word, before the runtime wrote anything, is the sandbox refusing the start (macOS)
+        raise BenchError(f"{name}: the outer layer did not start, so nothing was evaluated: "
+                         f"{err.strip()[-300:] or f'the runtime aborted at its start (exit {p.returncode})'}")
     if p.returncode != 0:
         if p.returncode in (-9, -24, 137, 152) or p.returncode == -getattr(__import__("signal"), "SIGXCPU", 24):
             raise Stopped("time", name)
