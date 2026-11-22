@@ -38,6 +38,11 @@ NO_WORDS = {"decl": [], "value": []}
 LIMITS = {"instructions": 20_000_000, "memory_kb": 64 * 1024, "string_bytes": 8 * 1024 * 1024,
           "output_bytes": 8 * 1024 * 1024}
 WALL_S = 10
+# the process's own ceiling, outside Lua: a long a..b..c, one instruction, allocates before the count hook can look.
+# Linux holds it as the address space (RLIMIT_AS); every system as a watch on the process's resident memory, which
+# ends it past the same size (macOS has no address-space limit that holds)
+PROCESS_MB = 256
+WATCH_S = 0.01
 FILE_MAX = 1024 * 1024          # one Lua source
 SOURCES_MAX = 8 * 1024 * 1024   # all the Lua sources of one package
 
@@ -65,12 +70,28 @@ class Stopped(BenchError):
 
 # ---- the reader ----
 
+_VERSIONS = {}
+
+
+def _version(p):
+    """What the runtime at P says it is: "Lua 5.1" (LuaJIT says so too), "Lua 5.4", or another."""
+    if p not in _VERSIONS:
+        try:
+            r = subprocess.run([p, "-e", "io.write(_VERSION)"], capture_output=True, text=True, timeout=10,
+                               cwd="/", env={"PATH": "/usr/bin:/bin", "LANG": "C"})
+            _VERSIONS[p] = r.stdout.strip() if r.returncode == 0 else ""
+        except (OSError, subprocess.TimeoutExpired):
+            _VERSIONS[p] = ""
+    return _VERSIONS[p]
+
+
 def runtime():
-    """The Lua runtime this machine has, as an absolute path."""
+    """The Lua runtime this machine has, as an absolute path: Lua 5.4, LuaJIT or Lua 5.1, whatever its name. Lua 5.2
+    and 5.3 are refused: the reader is checked on 5.1 and 5.4 only (their finalizers and C calls differ)."""
     for name in RUNTIMES:
         for d in RUNTIME_DIRS:
             p = os.path.join(d, name)
-            if os.path.isfile(p) and os.access(p, os.X_OK):
+            if os.path.isfile(p) and os.access(p, os.X_OK) and _version(p) in ("Lua 5.1", "Lua 5.4"):
                 return p
     raise BenchError("no Lua runtime on this machine: Bench reads with lua 5.4, LuaJIT or lua 5.1 "
                      "(macOS: brew install luajit; Debian or Ubuntu: apt install lua5.4)")
@@ -116,20 +137,59 @@ def lua_lit(v, depth=0):
 
 def _limits():
     """Run in the child before it starts Lua: no core file, no file written, no process started, processor time
-    bounded, and on Linux the address space too."""
+    bounded, and on Linux the address space too. A limit that cannot be set fails the start, so nothing is
+    evaluated without it (of_server, message 01a20547-5da1)."""
     import resource
     cpu = WALL_S + 1
-    for lim, val in ((resource.RLIMIT_CORE, 0), (resource.RLIMIT_FSIZE, 0), (resource.RLIMIT_CPU, cpu),
-                     (resource.RLIMIT_NPROC, 0)):
-        try:
-            resource.setrlimit(lim, (val, val))
-        except (ValueError, OSError):
-            pass
+    lims = [(resource.RLIMIT_CORE, 0), (resource.RLIMIT_FSIZE, 0), (resource.RLIMIT_CPU, cpu),
+            (resource.RLIMIT_NPROC, 0)]
     if sys.platform.startswith("linux"):
-        try:
-            resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
-        except (ValueError, OSError):
-            pass
+        lims.append((resource.RLIMIT_AS, PROCESS_MB << 20))
+    for lim, val in lims:
+        resource.setrlimit(lim, (val, val))     # raises: the child does not start
+
+
+def _rss_kb(pid):
+    """The process's resident memory in KiB, or None when it is gone."""
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+        return None
+    except OSError:
+        pass
+    if sys.platform.startswith("linux"):
+        return None
+    try:
+        r = subprocess.run(["/bin/ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True, timeout=2)
+        return int(r.stdout.strip()) if r.stdout.strip() else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def _watch(p, over):
+    """Until P ends: end it when its resident memory passes PROCESS_MB, and say so in OVER."""
+    import time
+    while p.poll() is None:
+        kb = _rss_kb(p.pid)
+        if kb is not None and kb > PROCESS_MB * 1024:
+            over.append(kb)
+            try:
+                os.killpg(p.pid, 9)
+            except OSError:
+                pass
+            return
+        time.sleep(WATCH_S)
+
+
+def _no_duplicates(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError(f"the key {k!r} twice")
+        d[k] = v
+    return d
 
 
 def evaluate(files, entry, words, *, mode="read", path=None, args=(), name=None, limits=None, wall_s=None):
@@ -151,8 +211,12 @@ def evaluate(files, entry, words, *, mode="read", path=None, args=(), name=None,
         p = subprocess.Popen([runtime(), "-"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              cwd="/", env={"PATH": "/usr/bin:/bin", "LANG": "C"}, close_fds=True,
                              start_new_session=True, preexec_fn=_limits)
-    except OSError as e:
-        raise BenchError(f"{name}: the reader did not start: {e}")
+    except (OSError, subprocess.SubprocessError) as e:
+        raise BenchError(f"{name}: the reader did not start, or its limits could not be set: {e}")
+    import threading
+    over = []
+    watcher = threading.Thread(target=_watch, args=(p, over), daemon=True)
+    watcher.start()
     try:
         out, err = p.communicate(program.encode("utf-8"), timeout=wall)
     except subprocess.TimeoutExpired:
@@ -162,6 +226,9 @@ def evaluate(files, entry, words, *, mode="read", path=None, args=(), name=None,
             p.kill()
         p.communicate()
         raise Stopped("time", name)
+    watcher.join(1)
+    if over:
+        raise Stopped("memory", name)
     err = err.decode("utf-8", "replace")
     m = re.search(r"bench-sandbox: stopped: (\w+)", err)
     if m:
@@ -173,10 +240,16 @@ def evaluate(files, entry, words, *, mode="read", path=None, args=(), name=None,
             raise Stopped("memory", name)
         raise BenchError(f"{name}: the reader failed (exit {p.returncode}): {err.strip()[-300:]}")
     try:
-        r = json.loads(out.decode("utf-8", "replace"))
-    except ValueError:
-        raise BenchError(f"{name}: the reader gave no result")
+        # strict: a text that is not UTF-8 is refused, never replaced, and a key written twice is refused, so what
+        # is read here is what Lua returned
+        r = json.loads(out.decode("utf-8"), object_pairs_hook=_no_duplicates)
+    except UnicodeDecodeError:
+        raise BenchError(f"{name}: the result holds a text that is not UTF-8")
+    except ValueError as e:
+        raise BenchError(f"{name}: the reader gave no result ({e})")
     if not r.get("ok"):
+        if "not enough memory" in str(r.get("error")):   # an allocation refused (RLIMIT_AS), caught inside the reader
+            raise Stopped("memory", name)
         raise BenchError(f"{name}: {r.get('error')}")
     return r["result"]
 

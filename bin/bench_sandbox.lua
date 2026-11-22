@@ -54,6 +54,45 @@ local function hook()
 end
 
 -- ---- the standard library a file is given ----
+-- Calls that re-enter Lua from C (a gsub callback, a resumed coroutine, a pcall, a sort's comparison) each take C
+-- stack; nested deep enough, LuaJIT crashed from pure Lua (of_server's reading, message 01a20547-5da1). They are
+-- counted here and refused past MAX_DEPTH, an error rather than a crash.
+local MAX_DEPTH, depth = 40, 0
+local function nested(what, f, ...)
+  if depth >= MAX_DEPTH then error(what .. ": nested deeper than " .. MAX_DEPTH .. " calls from C", 0) end
+  depth = depth + 1
+  local r = { pcall(f, ...) }
+  depth = depth - 1
+  if not r[1] then error(r[2], 0) end
+  return unpack(r, 2, r.n or #r)
+end
+local function packed(...) return { n = select("#", ...), ... } end
+local function nested_n(what, f, ...)
+  if depth >= MAX_DEPTH then error(what .. ": nested deeper than " .. MAX_DEPTH .. " calls from C", 0) end
+  depth = depth + 1
+  local r = packed(pcall(f, ...))
+  depth = depth - 1
+  if not r[1] then error(r[2], 0) end
+  return unpack(r, 2, r.n)
+end
+
+-- tostring without a table's, function's or thread's address: a reading holds no address, so the reading checked at
+-- install is the one used later
+local function safe_tostring(v)
+  local t = type(v)
+  if t == "table" or t == "function" or t == "thread" or t == "userdata" then
+    local mt = getmetatable(v)
+    local f = type(mt) == "table" and rawget(mt, "__tostring")
+    if f then
+      local r = f(v)
+      if type(r) ~= "string" then error("'__tostring' must return a string", 2) end
+      return r
+    end
+    return t
+  end
+  return tostring(v)
+end
+
 local function cap(n, what)
   if n > MAX_STR then error(what .. ": a string over " .. MAX_STR .. " bytes", 3) end
 end
@@ -72,6 +111,7 @@ function safe_string.rep(s, n, sep)
 end
 function safe_string.gsub(s, pattern, repl, n)
   s = tostring(s)
+  if type(repl) == "number" then repl = tostring(repl) end   -- as Lua would: a number is its text
   if type(repl) == "string" then
     cap(s_len(s) * (s_len(repl) + 1) + s_len(repl), "string.gsub")
     return s_gsub(s, pattern, repl, n)
@@ -85,10 +125,10 @@ function safe_string.gsub(s, pattern, repl, n)
     return v
   end
   if type(repl) == "function" then
-    return s_gsub(s, pattern, function(...) return counted(repl(...)) end, n)
+    return nested_n("string.gsub", s_gsub, s, pattern, function(...) return counted(repl(...)) end, n)
   end
   if type(repl) == "table" then
-    return s_gsub(s, pattern, function(k) return counted(repl[k]) end, n)
+    return nested_n("string.gsub", s_gsub, s, pattern, function(k) return counted(repl[k]) end, n)
   end
   return s_gsub(s, pattern, repl, n)
 end
@@ -97,6 +137,7 @@ end
 -- under %q up to four times its length), and a width or precision of up to 99 per directive
 function safe_string.format(f, ...)
   f = tostring(f)
+  if s_find(f, "%%[-+ #0]*%d*%.?%d*p") then error("string.format: %p writes an address, not given here", 2) end
   local total = s_len(f)
   local _, directives = s_gsub(f, "%%", "")
   total = total + directives * 100
@@ -104,7 +145,7 @@ function safe_string.format(f, ...)
   local args, n = {}, select("#", ...)
   for i = 1, n do
     local v = select(i, ...)
-    if type(v) ~= "number" and type(v) ~= "string" then v = tostring(v) end
+    if type(v) ~= "number" and type(v) ~= "string" then v = safe_tostring(v) end
     args[i] = v
     total = total + (type(v) == "string" and 4 * s_len(v) or 32)
     cap(total, "string.format")
@@ -112,7 +153,11 @@ function safe_string.format(f, ...)
   return s_format(f, unpack(args, 1, n))
 end
 
-local safe_table = { insert = t_insert, remove = t_remove, sort = t_sort, unpack = unpack }
+local safe_table = { insert = t_insert, remove = t_remove, unpack = unpack }
+function safe_table.sort(t, comp)
+  if comp == nil then return t_sort(t) end
+  return nested("table.sort", t_sort, t, function(a, b) return comp(a, b) end)
+end
 function safe_table.concat(t, sep, i, j)
   -- each value is read once, into a plain list, and that list is joined: what was counted is what is joined
   -- (an __index could give a short value to the count and a long one to the join)
@@ -135,16 +180,25 @@ local function new_thread(f)
   return co
 end
 local safe_coroutine = {
-  create = new_thread, resume = co_resume, yield = co_yield, status = co_status, running = co_running,
-  isyieldable = co_isyieldable,
+  create = new_thread, yield = co_yield, status = co_status, running = co_running, isyieldable = co_isyieldable,
 }
+function safe_coroutine.resume(co, ...)
+  return nested_n("coroutine.resume", co_resume, co, ...)
+end
 function safe_coroutine.wrap(f)
   local co = new_thread(f)
   return function(...)
-    local r = { co_resume(co, ...) }
+    local r = packed(nested_n("coroutine.wrap", co_resume, co, ...))
     if not r[1] then error(r[2], 2) end
-    return select(2, unpack(r))
+    return unpack(r, 2, r.n)
   end
+end
+local function safe_pcall(f, ...)
+  return nested_n("pcall", pcall, f, ...)
+end
+local function safe_xpcall(f, h, ...)
+  local args = packed(...)
+  return nested_n("xpcall", xpcall, function() return f(unpack(args, 1, args.n)) end, h)
 end
 
 local function safe_getmetatable(x)
@@ -232,13 +286,16 @@ end
 -- setmetatable without finalizers: Lua 5.4 runs a __gc with every hook off, so a finalizer would spend instructions
 -- and memory outside the budgets (5.4 marks an object for finalizing only when its metatable holds __gc then)
 local function safe_setmetatable(t, mt)
-  if type(mt) == "table" and rawget(mt, "__gc") ~= nil then error("setmetatable: __gc is not given here", 2) end
+  -- __close (5.4) too: it runs as a variable leaves its scope, an error's unwinding included
+  if type(mt) == "table" and (rawget(mt, "__gc") ~= nil or rawget(mt, "__close") ~= nil) then
+    error("setmetatable: __gc and __close are not given here", 2)
+  end
   return setmetatable(t, mt)
 end
 
 local GIVEN = {
-  assert = assert, error = error, ipairs = ipairs, next = next, pairs = pairs, pcall = pcall, select = select,
-  tonumber = tonumber, tostring = tostring, type = type, xpcall = xpcall, unpack = unpack,
+  assert = assert, error = error, ipairs = ipairs, next = next, pairs = pairs, pcall = safe_pcall, select = select,
+  tonumber = tonumber, tostring = safe_tostring, type = type, xpcall = safe_xpcall, unpack = unpack,
   rawequal = rawequal, rawget = rawget, rawset = rawset, rawlen = rawget(_G, "rawlen"),
   setmetatable = safe_setmetatable, getmetatable = safe_getmetatable,
   string = safe_string, table = safe_table, math = safe_math, coroutine = safe_coroutine,
@@ -287,7 +344,13 @@ local function encode(v, path, depth)
   elseif tv == "boolean" then emit(v and "true" or "false")
   elseif tv == "number" then
     if v ~= v or v == m_huge or v == -m_huge then error("a number that is not finite at " .. t_concat(path, "."), 0) end
-    if v == m_floor(v) and v > -2^53 and v < 2^53 then emit(s_format("%d", v)) else emit(s_format("%.17g", v)) end
+    if v == m_floor(v) then
+      -- a whole number past 2^53 is not one number once read back as JSON (2^63 and 1e300 collapse on LuaJIT)
+      if v <= -2^53 or v >= 2^53 then error("a whole number past 2^53 at " .. t_concat(path, "."), 0) end
+      emit(s_format("%d", v))
+    else
+      emit(s_format("%.17g", v))
+    end
   elseif tv == "string" then emit(json_string(v))
   elseif tv == "function" then
     -- kept, not called: its place, so a later call finds it again
@@ -314,6 +377,9 @@ local function encode(v, path, depth)
       emit("{")
       local keys, named = {}, {}
       for k in next, v do
+        if type(k) == "number" and k == m_floor(k) and (k <= -2^53 or k >= 2^53) then
+          error("a key past 2^53 at " .. t_concat(path, "."), 0)
+        end
         local name = type(k) == "number" and k == m_floor(k) and s_format("%d", k) or k
         if type(name) == "string" and named[name] then
           error("the keys " .. name .. " and \"" .. name .. "\" are one key once written out, at " .. t_concat(path, "."), 0)
