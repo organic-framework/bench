@@ -1,4 +1,4 @@
--- Bench's closed Lua environment (docs/bench.md, "The reader"). bin/of_bench.py runs this file in a Lua process of
+-- Bench's closed Lua environment (docs/bench.md, "The reader"). bin/bench.py runs this file in a Lua process of
 -- its own, fed on stdin after one line `local REQ = <data>`: the package's Lua sources, the words each file may use,
 -- and what to do. The process is given no file: it reads its program from stdin and writes JSON to stdout.
 --
@@ -63,7 +63,8 @@ local safe_string = {
   match = s_match, reverse = s_reverse, sub = s_sub, upper = s_upper,
 }
 function safe_string.rep(s, n, sep)
-  if type(n) ~= "number" then return s_rep(s, n, sep) end
+  n = tonumber(n)   -- Lua takes a count written as text too; cap what it will be, never the text
+  if n == nil then error("string.rep: a count is a number", 2) end
   local one = s_len(tostring(s)) + (sep and s_len(tostring(sep)) or 0)
   if n > 0 then cap(one * n, "string.rep") end
   if sep == nil then return s_rep(s, n) end
@@ -92,15 +93,37 @@ function safe_string.gsub(s, pattern, repl, n)
   return s_gsub(s, pattern, repl, n)
 end
 
+-- string.format: what the result can hold, before it is built: the format, each argument written out (a string
+-- under %q up to four times its length), and a width or precision of up to 99 per directive
+function safe_string.format(f, ...)
+  f = tostring(f)
+  local total = s_len(f)
+  local _, directives = s_gsub(f, "%%", "")
+  total = total + directives * 100
+  -- any other argument is written out once, here, and counted: a __tostring could give a long text at each %s
+  local args, n = {}, select("#", ...)
+  for i = 1, n do
+    local v = select(i, ...)
+    if type(v) ~= "number" and type(v) ~= "string" then v = tostring(v) end
+    args[i] = v
+    total = total + (type(v) == "string" and 4 * s_len(v) or 32)
+    cap(total, "string.format")
+  end
+  return s_format(f, unpack(args, 1, n))
+end
+
 local safe_table = { insert = t_insert, remove = t_remove, sort = t_sort, unpack = unpack }
 function safe_table.concat(t, sep, i, j)
-  local total, sl = 0, sep and s_len(tostring(sep)) or 0
+  -- each value is read once, into a plain list, and that list is joined: what was counted is what is joined
+  -- (an __index could give a short value to the count and a long one to the join)
+  local total, sl, list = 0, sep and s_len(tostring(sep)) or 0, {}
   for k = i or 1, j or #t do
     local v = t[k]
     if type(v) == "string" or type(v) == "number" then total = total + s_len(tostring(v)) + sl end
     cap(total, "table.concat")
+    list[#list + 1] = v
   end
-  return t_concat(t, sep, i, j)
+  return t_concat(list, sep)
 end
 
 local safe_math = {}
@@ -206,11 +229,18 @@ local function sandbox_require(name)
   return r
 end
 
+-- setmetatable without finalizers: Lua 5.4 runs a __gc with every hook off, so a finalizer would spend instructions
+-- and memory outside the budgets (5.4 marks an object for finalizing only when its metatable holds __gc then)
+local function safe_setmetatable(t, mt)
+  if type(mt) == "table" and rawget(mt, "__gc") ~= nil then error("setmetatable: __gc is not given here", 2) end
+  return setmetatable(t, mt)
+end
+
 local GIVEN = {
   assert = assert, error = error, ipairs = ipairs, next = next, pairs = pairs, pcall = pcall, select = select,
   tonumber = tonumber, tostring = tostring, type = type, xpcall = xpcall, unpack = unpack,
   rawequal = rawequal, rawget = rawget, rawset = rawset, rawlen = rawget(_G, "rawlen"),
-  setmetatable = setmetatable, getmetatable = safe_getmetatable,
+  setmetatable = safe_setmetatable, getmetatable = safe_getmetatable,
   string = safe_string, table = safe_table, math = safe_math, coroutine = safe_coroutine,
   require = sandbox_require,
 }
@@ -282,8 +312,13 @@ local function encode(v, path, depth)
       emit("]")
     else
       emit("{")
-      local keys = {}
+      local keys, named = {}, {}
       for k in next, v do
+        local name = type(k) == "number" and k == m_floor(k) and s_format("%d", k) or k
+        if type(name) == "string" and named[name] then
+          error("the keys " .. name .. " and \"" .. name .. "\" are one key once written out, at " .. t_concat(path, "."), 0)
+        end
+        if type(name) == "string" then named[name] = true end
         if type(k) == "string" then keys[#keys + 1] = k
         elseif type(k) == "number" and k == m_floor(k) then keys[#keys + 1] = k
         else error("a key that is neither a string nor a whole number at " .. t_concat(path, "."), 0) end
