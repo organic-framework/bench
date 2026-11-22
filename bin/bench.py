@@ -210,8 +210,13 @@ def _limits():
         resource.setrlimit(lim, (val, val))     # raises: the child does not start
 
 
+class _WatchFailed(Exception):
+    pass
+
+
 def _rss_kb(pid):
-    """The process's resident memory in KiB, or None when it is gone."""
+    """The process's resident memory in KiB, or None when it is gone. _WatchFailed when it cannot be read while the
+    process may still run (macOS: ps failed or timed out): the watch then ends it, never carries on blind."""
     try:
         with open(f"/proc/{pid}/status") as f:
             for line in f:
@@ -224,22 +229,59 @@ def _rss_kb(pid):
         return None
     try:
         r = subprocess.run(["/bin/ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True, timeout=2)
-        return int(r.stdout.strip()) if r.stdout.strip() else None
-    except (OSError, ValueError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise _WatchFailed(str(e))
+    if r.returncode != 0 and not r.stdout.strip():
+        return None                      # ps found no such process: it is gone
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        raise _WatchFailed(f"ps said {r.stdout.strip()[:80]!r}")
+
+
+def _child_pid(status_fd, buf):
+    """The runtime's pid as bwrap's --json-status-fd gives it ({"child-pid": N}), once it is there, else None."""
+    import select
+    if status_fd is None:
         return None
+    while select.select([status_fd], [], [], 0)[0]:
+        chunk = os.read(status_fd, 4096)
+        if not chunk:
+            break
+        buf.extend(chunk)
+    for line in bytes(buf).splitlines():
+        try:
+            pid = json.loads(line).get("child-pid")
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(pid, int):
+            return pid
+    return None
 
 
-def _watch(p, over):
-    """Until P ends: end it when its resident memory passes PROCESS_MB, and say so in OVER."""
+def _watch(p, over, status_fd=None):
+    """Until P ends: end it when the runtime's resident memory passes PROCESS_MB, or when that memory cannot be read,
+    and say so in OVER. Under bwrap, P is bwrap and the runtime its child (STATUS_FD names it); P is killed, and
+    --die-with-parent ends the child with it."""
     import time
+    buf, pid = bytearray(), None
     while p.poll() is None:
-        kb = _rss_kb(p.pid)
-        if kb is not None and kb > PROCESS_MB * 1024:
-            over.append(kb)
-            try:
-                os.killpg(p.pid, 9)
-            except OSError:
-                pass
+        if status_fd is not None and pid is None:
+            pid = _child_pid(status_fd, buf)
+        try:
+            kb = _rss_kb(pid or p.pid)
+        except _WatchFailed as e:
+            over.append(f"the memory watch failed: {e}")
+            kb = None
+        else:
+            if kb is not None and kb > PROCESS_MB * 1024:
+                over.append(kb)
+        if over:
+            for kill in (lambda: os.killpg(p.pid, 9), lambda: os.kill(p.pid, 9)):
+                try:
+                    kill()
+                except OSError:
+                    pass
             return
         time.sleep(WATCH_S)
 
@@ -270,15 +312,25 @@ def evaluate(files, entry, words, *, mode="read", path=None, args=(), name=None,
     wall = wall_s or WALL_S
     rt = runtime()
     cmd = [rt, "-"] if OUTER == "off" else _outer(rt)
+    status_r = status_w = None
+    if cmd[0] == BWRAP:      # bwrap says the runtime's pid on this pipe, for the memory watch
+        status_r, status_w = os.pipe()
+        cmd = cmd[:1] + ["--json-status-fd", str(status_w)] + cmd[1:]
     try:
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              cwd="/", env={"PATH": "/usr/bin:/bin", "LANG": "C"}, close_fds=True,
+                             pass_fds=(status_w,) if status_w is not None else (),
                              start_new_session=True, preexec_fn=_limits)
     except (OSError, subprocess.SubprocessError) as e:
+        for fd in (status_r, status_w):
+            if fd is not None:
+                os.close(fd)
         raise BenchError(f"{name}: the reader did not start, or its limits could not be set: {e}")
+    if status_w is not None:
+        os.close(status_w)
     import threading
     over = []
-    watcher = threading.Thread(target=_watch, args=(p, over), daemon=True)
+    watcher = threading.Thread(target=_watch, args=(p, over, status_r), daemon=True)
     watcher.start()
     try:
         out, err = p.communicate(program.encode("utf-8"), timeout=wall)
@@ -290,7 +342,11 @@ def evaluate(files, entry, words, *, mode="read", path=None, args=(), name=None,
         p.communicate()
         raise Stopped("time", name)
     watcher.join(1)
+    if status_r is not None:
+        os.close(status_r)
     if over:
+        if isinstance(over[0], str):
+            raise BenchError(f"{name}: {over[0]}; the evaluation was ended")
         raise Stopped("memory", name)
     err = err.decode("utf-8", "replace")
     m = re.search(r"bench-sandbox: stopped: (\w+)", err)

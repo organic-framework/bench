@@ -76,8 +76,8 @@ local function nested_n(what, f, ...)
   return unpack(r, 2, r.n)
 end
 
--- tostring without a table's, function's or thread's address: a reading holds no address, so the reading checked at
--- install is the one used later
+-- tostring without a table's, function's or thread's address: a reading holds no address (of_server, messages
+-- 01a20547-5da1 and 01a20573-e987). It does not make a reading the same from run to run: pairs' order may differ
 local function safe_tostring(v)
   local t = type(v)
   if t == "table" or t == "function" or t == "thread" or t == "userdata" then
@@ -104,13 +104,13 @@ local safe_string = {
 function safe_string.rep(s, n, sep)
   n = tonumber(n)   -- Lua takes a count written as text too; cap what it will be, never the text
   if n == nil then error("string.rep: a count is a number", 2) end
-  local one = s_len(tostring(s)) + (sep and s_len(tostring(sep)) or 0)
+  local one = s_len(safe_tostring(s)) + (sep and s_len(safe_tostring(sep)) or 0)
   if n > 0 then cap(one * n, "string.rep") end
   if sep == nil then return s_rep(s, n) end
   return s_rep(s, n, sep)
 end
 function safe_string.gsub(s, pattern, repl, n)
-  s = tostring(s)
+  s = safe_tostring(s)
   if type(repl) == "number" then repl = tostring(repl) end   -- as Lua would: a number is its text
   if type(repl) == "string" then
     cap(s_len(s) * (s_len(repl) + 1) + s_len(repl), "string.gsub")
@@ -136,8 +136,11 @@ end
 -- string.format: what the result can hold, before it is built: the format, each argument written out (a string
 -- under %q up to four times its length), and a width or precision of up to 99 per directive
 function safe_string.format(f, ...)
-  f = tostring(f)
-  if s_find(f, "%%[-+ #0]*%d*%.?%d*p") then error("string.format: %p writes an address, not given here", 2) end
+  f = safe_tostring(f)
+  -- %p writes an address; "%%p" is a percent sign and a p, so the escaped percent signs are taken out first
+  if s_find((s_gsub(f, "%%%%", "")), "%%[-+ #0]*%d*%.?%d*p") then
+    error("string.format: %p writes an address, not given here", 2)
+  end
   local total = s_len(f)
   local _, directives = s_gsub(f, "%%", "")
   total = total + directives * 100
@@ -161,7 +164,8 @@ end
 function safe_table.concat(t, sep, i, j)
   -- each value is read once, into a plain list, and that list is joined: what was counted is what is joined
   -- (an __index could give a short value to the count and a long one to the join)
-  local total, sl, list = 0, sep and s_len(tostring(sep)) or 0, {}
+  if sep ~= nil then sep = safe_tostring(sep) end
+  local total, sl, list = 0, sep and s_len(sep) or 0, {}
   for k = i or 1, j or #t do
     local v = t[k]
     if type(v) == "string" or type(v) == "number" then total = total + s_len(tostring(v)) + sl end
@@ -173,6 +177,7 @@ end
 
 local safe_math = {}
 for k, v in pairs(math) do safe_math[k] = v end
+safe_math.random, safe_math.randomseed = nil, nil   -- a reading does not depend on a seed
 
 local function new_thread(f)
   local co = co_create(f)
@@ -283,20 +288,38 @@ local function sandbox_require(name)
   return r
 end
 
--- setmetatable without finalizers: Lua 5.4 runs a __gc with every hook off, so a finalizer would spend instructions
--- and memory outside the budgets (5.4 marks an object for finalizing only when its metatable holds __gc then)
+-- setmetatable without finalizers or to-be-closed values: Lua 5.4 runs a __gc with every hook off, and reads __close
+-- when a variable is declared, so a metatable must not hold them then or later (of_server, message 01a20573-e987). A
+-- file's metatable is installed as a copy that refuses those two keys afterwards (its own __newindex; rawset is
+-- guarded too); a later change to the table the file passed does not reach the copy.
+local CLOSING = { __gc = true, __close = true }
+local guarded = setmetatable({}, { __mode = "k" })
+local GUARD = {
+  __newindex = function(c, k, v)
+    if CLOSING[k] then error("setmetatable: " .. k .. " is not given here", 2) end
+    rawset(c, k, v)
+  end,
+}
 local function safe_setmetatable(t, mt)
-  -- __close (5.4) too: it runs as a variable leaves its scope, an error's unwinding included
-  if type(mt) == "table" and (rawget(mt, "__gc") ~= nil or rawget(mt, "__close") ~= nil) then
-    error("setmetatable: __gc and __close are not given here", 2)
+  if type(mt) ~= "table" then return setmetatable(t, mt) end
+  local c = {}
+  for k, v in next, mt do
+    if CLOSING[k] then error("setmetatable: __gc and __close are not given here", 2) end
+    c[k] = v
   end
-  return setmetatable(t, mt)
+  setmetatable(c, GUARD)
+  guarded[c] = true
+  return setmetatable(t, c)
+end
+local function safe_rawset(t, k, v)
+  if guarded[t] and CLOSING[k] then error("rawset: " .. tostring(k) .. " is not given here", 2) end
+  return rawset(t, k, v)
 end
 
 local GIVEN = {
   assert = assert, error = error, ipairs = ipairs, next = next, pairs = pairs, pcall = safe_pcall, select = select,
   tonumber = tonumber, tostring = safe_tostring, type = type, xpcall = safe_xpcall, unpack = unpack,
-  rawequal = rawequal, rawget = rawget, rawset = rawset, rawlen = rawget(_G, "rawlen"),
+  rawequal = rawequal, rawget = rawget, rawset = safe_rawset, rawlen = rawget(_G, "rawlen"),
   setmetatable = safe_setmetatable, getmetatable = safe_getmetatable,
   string = safe_string, table = safe_table, math = safe_math, coroutine = safe_coroutine,
   require = sandbox_require,

@@ -398,6 +398,45 @@ class ReaderHostileTest(_EachRuntime):
         for _ in self.each():
             self.assertEqual(self.read("return 2^53 - 1")["returned"], 2 ** 53 - 1)
 
+    # of_server's second reading, message 01a20573-e987
+    def test_no_address_through_a_first_argument(self):
+        for _ in self.each():
+            r = self.read('return { (string.gsub({}, "x", "y")), string.format(type), string.format("%%p"), '
+                          'table.concat({"a", "b"}, {}) }')["returned"]
+            self.assertEqual(r, ["table", "function", "%p", "atableb"])
+
+    def test_a_closing_key_set_later_is_refused(self):
+        for src in ('local t = setmetatable({}, {}) getmetatable(t).__close = function() end return 1',
+                    'local t = setmetatable({}, {}) getmetatable(t).__gc = function() end return 1',
+                    'local t = setmetatable({}, {}) rawset(getmetatable(t), "__close", function() end) return 1',
+                    # the table the file passed is not the one installed: closing it later reaches nothing
+                    'local mt = {} local t = setmetatable({}, mt) mt.__close = function() while true do end end '
+                    'local ok = pcall(function() for _ in function() return nil end, nil, nil, t do end end) '
+                    'error("no closing")'):
+            self.refused(src)
+
+    def test_the_random_numbers_are_not_given(self):
+        for _ in self.each():
+            self.assertEqual(self.read("return { math.random == nil, math.randomseed == nil }")["returned"],
+                             [True, True])
+
+    def test_bwraps_status_names_the_runtime_and_a_failed_watch_ends_it(self):
+        r, w = os.pipe()
+        os.write(w, b'{ "child-pid": 4242 }\n')
+        os.close(w)
+        try:
+            self.assertEqual(bench._child_pid(r, bytearray()), 4242)
+        finally:
+            os.close(r)
+        saved = sys.platform, bench.subprocess.run
+        sys.platform = "darwin"
+        bench.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(bench.subprocess.TimeoutExpired("ps", 2))
+        try:
+            with self.assertRaises(bench._WatchFailed):
+                bench._rss_kb(2 ** 30)      # no /proc entry for it: the macOS path, where ps times out
+        finally:
+            sys.platform, bench.subprocess.run = saved
+
     def test_a_limit_that_cannot_be_set_stops_the_start(self):
         saved = bench._limits
         bench._limits = lambda: (_ for _ in ()).throw(OSError("refused"))
@@ -707,6 +746,21 @@ class OuterLayerTest(unittest.TestCase):
         for what, lua in probes.items():
             r = self.layer_runs(lua)
             self.assertEqual((r.returncode, r.stdout.strip()), (0, "nil"), f"{what} was reached: {r.stdout!r} {r.stderr!r}")
+        # the watch follows the runtime inside the layer, not the layer's own small process (of_server, message
+        # 01a20573-e987): with the address-space limit lifted for this test, it alone must end a runtime that grows
+        saved = bench._limits, bench.PROCESS_MB
+        bench.PROCESS_MB = 96
+        def no_as():
+            import resource
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        bench._limits = no_as
+        try:
+            with self.assertRaises(bench.Stopped) as cm:
+                bench.evaluate({"x.lua": 'local t = {} for i = 1, 40 do t[i] = ("x"):rep(8000000 - i) end return #t'},
+                               "x.lua", bench.NO_WORDS, limits={"memory_kb": 2 ** 21, "instructions": 10 ** 9})
+            self.assertEqual(cm.exception.reason, "memory")
+        finally:
+            bench._limits, bench.PROCESS_MB = saved
         r = self.layer_runs('io.write(tostring(os.execute("/bin/sh -c true")))')
         self.assertNotIn(r.stdout.strip(), ("true", "0"), f"a program ran inside the outer layer: {r.stderr!r}")
         self.assertFalse(os.path.exists("/tmp/bench-outer-probe"))
