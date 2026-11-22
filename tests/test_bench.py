@@ -20,6 +20,11 @@ import bench  # noqa: E402
 METHOD_WORDS = {"decl": ["roles", "subject", "setting", "module", "extendable", "event"],
                 "value": ["skill", "tool", "command", "record", "schedule", "turn_end", "act", "role", "classifier"]}
 
+# These tests are of the in-process layer (the closed environment, its budgets) and of what Bench does with files;
+# the outer layer, the operating-system sandbox every real evaluation runs in, has its own tests (OuterLayerTest).
+# It cannot start inside an agent session's own sandbox, where these tests also run, so they set it off in code.
+bench.OUTER = "off"
+
 FAST = {"instructions": 2_000_000}
 
 
@@ -639,6 +644,67 @@ class ForkTest(_Project):
         r = bench.rebase(self.org, "demo-asks", identity=("t", "t@example.invalid"), log=self.logs.append)
         self.assertEqual((r["rebased"], r["conflicts"]), (False, ["lib/routing.lua"]))
         self.assertTrue(any("git rebase --abort" in x for x in self.logs))
+
+
+class OuterLayerTest(unittest.TestCase):
+    """The outer layer (of_server, message 01a20566-e23c): every evaluation inside bwrap (Linux) or sandbox-exec
+    (macOS), and nothing evaluated when it cannot start. Where it cannot start (an agent session's sandbox) only the
+    refusal is tested; CI and the Lab, where it starts, run the rest, and in CI it must start."""
+
+    def setUp(self):
+        if not runtimes():
+            self.skipTest("no Lua runtime on this machine")
+        bench.OUTER = "required"
+
+    def tearDown(self):
+        bench.OUTER = "off"
+
+    def starts(self):
+        try:
+            bench.evaluate({"x.lua": "return 1"}, "x.lua", bench.NO_WORDS)
+            return True
+        except bench.BenchError as e:
+            self.assertIn("the outer layer", str(e))
+            return False
+
+    def test_nothing_is_evaluated_without_it(self):
+        if self.starts():
+            saved = bench.BWRAP, bench.SANDBOX_EXEC
+            bench.BWRAP = bench.SANDBOX_EXEC = "/nonexistent/sandbox"
+            try:
+                with self.assertRaisesRegex(bench.BenchError, "the outer layer"):
+                    bench.evaluate({"x.lua": "return 1"}, "x.lua", bench.NO_WORDS)
+            finally:
+                bench.BWRAP, bench.SANDBOX_EXEC = saved
+        else:
+            with self.assertRaisesRegex(bench.BenchError, "the outer layer"):
+                bench.evaluate({"x.lua": "return 1"}, "x.lua", bench.NO_WORDS)
+
+    def layer_runs(self, lua):
+        """LUA run by the bare runtime, with its whole library, inside the outer layer: what native code that got
+        past the closed environment would meet."""
+        rt = bench.runtime()
+        cmd = bench._outer(rt)
+        cmd = cmd[:-1] + ["-e", lua]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+    def test_inside_it_nothing_of_the_machine_is_reached(self):
+        if not self.starts():
+            if os.environ.get("CI"):
+                self.fail("the outer layer does not start in CI")
+            self.skipTest("the outer layer cannot start here (an agent session's sandbox): CI and the Lab run this")
+        self.assertEqual(bench.evaluate({"x.lua": "return 1 + 1"}, "x.lua", bench.NO_WORDS)["returned"], 2)
+        # each io.open must give nil (nothing there to open); os.execute must not succeed (5.4 says true, 5.1 says 0)
+        for what, lua in {"a file of the machine": 'io.write(tostring(io.open("/etc/passwd")))',
+                          "the home folder": 'io.write(tostring(io.open("/home")))',
+                          "a write": 'io.write(tostring(io.open("/tmp/bench-outer-probe", "w")))'}.items():
+            r = self.layer_runs(lua)
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, "nil"), f"{what} was reached: {r.stdout!r} {r.stderr!r}")
+        r = self.layer_runs('io.write(tostring(os.execute("/bin/sh -c true")))')
+        self.assertNotIn(r.stdout.strip(), ("true", "0"), f"a program ran inside the outer layer: {r.stderr!r}")
+        self.assertFalse(os.path.exists("/tmp/bench-outer-probe"))
+        r = self.layer_runs('local f = io.popen("cat /proc/net/route 2>/dev/null") io.write(tostring(f and f:read("*a")))')
+        self.assertNotIn("00000000", r.stdout)   # no route out: no network
 
 
 if __name__ == "__main__":

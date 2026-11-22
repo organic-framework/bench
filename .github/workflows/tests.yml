@@ -16,6 +16,12 @@ jobs:
       # the reader is checked on every runtime it takes: Lua 5.4, LuaJIT and Lua 5.1; a test that finds none fails
       - name: Install Lua
         run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends lua5.4 luajit lua5.1
+      # the outer layer every evaluation runs in (docs/bench.md): bwrap, which Ubuntu 24.04's AppArmor keeps from
+      # making user namespaces until this is lifted; in CI its tests must run, never skip
+      - name: Install bwrap
+        run: |
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Unit suite
         env:
           GIT_CONFIG_GLOBAL: /dev/null
