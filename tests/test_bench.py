@@ -409,11 +409,21 @@ class ReaderHostileTest(_EachRuntime):
         for src in ('local t = setmetatable({}, {}) getmetatable(t).__close = function() end return 1',
                     'local t = setmetatable({}, {}) getmetatable(t).__gc = function() end return 1',
                     'local t = setmetatable({}, {}) rawset(getmetatable(t), "__close", function() end) return 1',
+                    # the guard cannot be taken off the copy, nor the copy read back (of_server, 01a20583-01b4)
+                    'local t = setmetatable({}, {}) setmetatable(getmetatable(t), nil) '
+                    'getmetatable(t).__close = function() end return 1',
+                    'local t = setmetatable({}, {}) local g = getmetatable(getmetatable(t)) g.__newindex = nil return 1',
                     # the table the file passed is not the one installed: closing it later reaches nothing
                     'local mt = {} local t = setmetatable({}, mt) mt.__close = function() while true do end end '
                     'local ok = pcall(function() for _ in function() return nil end, nil, nil, t do end end) '
                     'error("no closing")'):
             self.refused(src)
+
+    def test_an_installed_metatable_still_works_and_is_not_given_out(self):
+        for _ in self.each():
+            r = self.read('local t = setmetatable({}, { __index = function(_, k) return k .. "!" end, '
+                          '__tostring = function() return "T" end }) return { t.a, tostring(t), getmetatable(t) }')
+            self.assertEqual(r["returned"], ["a!", "T", False])
 
     def test_the_random_numbers_are_not_given(self):
         for _ in self.each():
@@ -740,6 +750,17 @@ class OuterLayerTest(unittest.TestCase):
             self.assertIn("the outer layer", str(e))
             return False
 
+    @staticmethod
+    def in_a_session_sandbox():
+        """True only where the kernel refuses a new namespace because this runs inside another sandbox's (an agent
+        session's): the one place the layer may not start without a test failing (of_server, message
+        01a20583-01b4: a skip had hidden a profile that did not start on macOS)."""
+        if not sys.platform.startswith("linux") or not os.access(bench.BWRAP, os.X_OK):
+            return False
+        r = subprocess.run([bench.BWRAP, "--unshare-user", "--ro-bind", "/", "/", "/usr/bin/true"],
+                           capture_output=True, text=True, timeout=10)
+        return r.returncode != 0 and "Creating new namespace failed" in r.stderr
+
     def test_nothing_is_evaluated_without_it(self):
         if self.starts():
             saved = bench.BWRAP, bench.SANDBOX_EXEC
@@ -763,9 +784,9 @@ class OuterLayerTest(unittest.TestCase):
 
     def test_inside_it_nothing_of_the_machine_is_reached(self):
         if not self.starts():
-            if os.environ.get("CI"):
-                self.fail("the outer layer does not start in CI")
-            self.skipTest("the outer layer cannot start here (an agent session's sandbox): CI and the Lab run this")
+            if self.in_a_session_sandbox() and not os.environ.get("CI"):
+                self.skipTest("the outer layer cannot start here (an agent session's sandbox): CI and the Lab run this")
+            self.fail("the outer layer does not start on this machine (not inside another sandbox)")
         self.assertEqual(bench.evaluate({"x.lua": "return 1 + 1"}, "x.lua", bench.NO_WORDS)["returned"], 2)
         # each io.open must give nil (nothing there to open); os.execute must not succeed (5.4 says true, 5.1 says 0)
         # files of the machine, of its system data and of its people, on Linux and macOS (of_lab on macOS, message

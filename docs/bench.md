@@ -68,7 +68,9 @@ are a framework's, and answer only through one (`of bench …`).
 **Two layers.** The outer one is the operating system's: every evaluation starts the Lua process inside bwrap on
 Linux (no network; fresh user, process, mount and IPC namespaces; a read-only root holding the runtime and the
 libraries it loads, nothing else; no environment) or a deny-by-default sandbox-exec profile on macOS (it may run the
-runtime and read the runtime, its libraries and the system's; nothing else). When the outer layer cannot start,
+runtime and read the runtime, its libraries and the system's own files; the machine's and its people's data, writes,
+the network and every other program are denied). On Linux each evaluation also runs in a transient scope of the
+user's systemd manager that bounds its processes (8) and their memory together (512 MiB). When the outer layer cannot start,
 nothing is evaluated and Bench says so. It cannot start inside an agent session's own sandbox, so an agent session
 evaluates nothing: OF's listener evaluates an organization's files, outside sessions (of_server's decision,
 organic-framework-build message `01a20566-e23c`). The inner layer is the closed environment below.
@@ -141,9 +143,11 @@ organic-framework's `bin/of_method.py`, set by `of bench`.
 
 ## Not yet tested
 
-The outer layer's own tests (`OuterLayerTest`) need a machine where bwrap starts: CI (which must run them) and the
-Lab. From an agent session only the refusal is tested. The macOS profile and the watch on resident memory there
-(it reads `ps`) are not tested yet.
+The outer layer's own tests (`OuterLayerTest`) run where it starts: the Lab ran them on Linux and macOS. Inside an
+agent session's sandbox, where no namespace can be made, they skip; anywhere else a layer that does not start fails
+them. On macOS a residual is stated, information only: reads of the system's own files, the user's record
+(getpwuid) through the services the profile's base allows, file metadata and sysctl everywhere, and
+`~/.CFUserTextEncoding`, which macOS reads at every process's start.
 
 ## Code
 
