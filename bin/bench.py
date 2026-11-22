@@ -244,6 +244,45 @@ def _rss_kb(pid):
         raise _WatchFailed(f"ps said {r.stdout.strip()[:80]!r}")
 
 
+def _tree(pid):
+    """PID and every process under it (Linux): /proc's children lists, else each process's parent in its stat."""
+    out, todo = [], [pid]
+    while todo:
+        q = todo.pop()
+        out.append(q)
+        kids = []
+        try:
+            for t in os.listdir(f"/proc/{q}/task"):
+                with open(f"/proc/{q}/task/{t}/children") as f:
+                    kids += [int(x) for x in f.read().split()]
+        except OSError:
+            try:
+                for d in os.listdir("/proc"):
+                    if d.isdigit():
+                        with open(f"/proc/{d}/stat") as f:
+                            if int(f.read().rsplit(")", 1)[1].split()[1]) == q:
+                                kids.append(int(d))
+            except (OSError, ValueError, IndexError):
+                pass
+        todo += [k for k in kids if k not in out]
+    return out
+
+
+def _tree_rss_kb(pid):
+    """The resident memory of PID and every process under it, in KiB; None when PID is gone. Under bwrap with its own
+    process namespace, the child it names is its init, and the runtime that grows is that init's child (of_lab,
+    message 01a2057d-5bde): the watch counts the whole tree."""
+    if not sys.platform.startswith("linux"):
+        return _rss_kb(pid)
+    total, seen = 0, False
+    for q in _tree(pid):
+        kb = _rss_kb(q)
+        if kb is not None:
+            total += kb
+            seen = True
+    return total if seen else None
+
+
 def _child_pid(status_fd, buf):
     """The runtime's pid as bwrap's --json-status-fd gives it ({"child-pid": N}), once it is there, else None."""
     import select
@@ -274,7 +313,7 @@ def _watch(p, over, status_fd=None):
         if status_fd is not None and pid is None:
             pid = _child_pid(status_fd, buf)
         try:
-            kb = _rss_kb(pid or p.pid)
+            kb = _tree_rss_kb(pid or p.pid)
         except _WatchFailed as e:
             over.append(f"the memory watch failed: {e}")
             kb = None
