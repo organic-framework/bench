@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# bench: the package manager's command (docs/bench.md). Bench needs Python 3 and a Lua runtime (Lua 5.4, LuaJIT or 5.1).
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+exec python3 "$here/bench.py" "$@"

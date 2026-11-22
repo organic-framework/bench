@@ -14,7 +14,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "bin"))
 
-import of_bench  # noqa: E402
+import bench  # noqa: E402
 import of_method  # noqa: E402
 
 FAST = {"instructions": 2_000_000}
@@ -23,7 +23,7 @@ FAST = {"instructions": 2_000_000}
 def runtimes():
     found = []
     for name in ("lua5.4", "luajit", "lua5.1"):
-        for d in of_bench.RUNTIME_DIRS:
+        for d in bench.RUNTIME_DIRS:
             p = os.path.join(d, name)
             if os.path.isfile(p) and p not in found:
                 found.append(p)
@@ -38,20 +38,20 @@ class _EachRuntime(unittest.TestCase):
         rts = runtimes()
         if not rts:
             self.skipTest("no Lua runtime on this machine")
-        saved = of_bench.RUNTIMES, of_bench.RUNTIME_DIRS
+        saved = bench.RUNTIMES, bench.RUNTIME_DIRS
         try:
             for rt in rts:
-                of_bench.RUNTIMES, of_bench.RUNTIME_DIRS = (os.path.basename(rt),), (os.path.dirname(rt),)
+                bench.RUNTIMES, bench.RUNTIME_DIRS = (os.path.basename(rt),), (os.path.dirname(rt),)
                 with self.subTest(runtime=os.path.basename(rt)):
                     yield rt
         finally:
-            of_bench.RUNTIMES, of_bench.RUNTIME_DIRS = saved
+            bench.RUNTIMES, bench.RUNTIME_DIRS = saved
 
-    def read(self, src, words=of_bench.NO_WORDS, files=None, **kw):
+    def read(self, src, words=bench.NO_WORDS, files=None, **kw):
         files = dict(files or {})
         files["x.lua"] = src
         kw["limits"] = dict(FAST, **kw.get("limits", {}))
-        return of_bench.evaluate(files, "x.lua", words, **kw)
+        return bench.evaluate(files, "x.lua", words, **kw)
 
 
 # ---- part 1: the reader ----
@@ -171,12 +171,12 @@ class ReaderExamplesTest(_EachRuntime):
 
     def test_the_package_spec(self):
         for _ in self.each():
-            r = self.read(SPEC_10, of_bench.SPEC_WORDS)
+            r = self.read(SPEC_10, bench.SPEC_WORDS)
             words = [d["word"] for d in r["decls"]]
             self.assertEqual(words, ["package", "depends", "needs"])
             self.assertEqual(r["decls"][0]["body"]["version"], "1.0.0")
             self.assertEqual(r["decls"][2]["body"]["model"], ["small"])
-            r = self.read(OF_SPEC_10, of_bench.SPEC_WORDS)
+            r = self.read(OF_SPEC_10, bench.SPEC_WORDS)
             self.assertIn("of-asks    ~> 1", r["decls"][1]["body"])
 
     def test_the_method_with_its_lib_files(self):
@@ -195,7 +195,7 @@ class ReaderExamplesTest(_EachRuntime):
 
     def test_the_benchfile_and_a_settings_file(self):
         for _ in self.each():
-            r = self.read(BENCHFILE_10, of_bench.BENCHFILE_WORDS)
+            r = self.read(BENCHFILE_10, bench.BENCHFILE_WORDS)
             self.assertEqual([(d["word"], d.get("name")) for d in r["decls"]][:3],
                              [("source", "https://bench.useorganic.ai"), ("package", "organic-framework"),
                               ("package", "alerts")])
@@ -214,7 +214,7 @@ class ReaderExamplesTest(_EachRuntime):
 
     def test_an_unknown_word_is_refused(self):
         for _ in self.each():
-            with self.assertRaisesRegex(of_bench.BenchError, 'unknown name "modul"'):
+            with self.assertRaisesRegex(bench.BenchError, 'unknown name "modul"'):
                 self.read('modul "x" {}', of_method.METHOD_WORDS)
 
 
@@ -223,13 +223,13 @@ class ReaderHostileTest(_EachRuntime):
 
     def refused(self, src, files=None):
         for _ in self.each():
-            with self.assertRaises(of_bench.BenchError) as cm:
+            with self.assertRaises(bench.BenchError) as cm:
                 self.read(src, files=files)
-            self.assertNotIsInstance(cm.exception, of_bench.Stopped)
+            self.assertNotIsInstance(cm.exception, bench.Stopped)
 
     def stopped(self, src, reason, **kw):
         for _ in self.each():
-            with self.assertRaises(of_bench.Stopped) as cm:
+            with self.assertRaises(bench.Stopped) as cm:
                 self.read(src, **kw)
             self.assertEqual(cm.exception.reason, reason)
 
@@ -268,7 +268,7 @@ class ReaderHostileTest(_EachRuntime):
         for _ in self.each():
             d = tempfile.mkdtemp()
             try:
-                with self.assertRaises(of_bench.BenchError):
+                with self.assertRaises(bench.BenchError):
                     self.read(f'local f = io.open("{d}/out", "w") f:write("x") f:close()')
                 self.assertEqual(os.listdir(d), [])
             finally:
@@ -285,9 +285,9 @@ class ReaderHostileTest(_EachRuntime):
 
     def test_a_compiled_chunk_is_not_loaded(self):
         for _ in self.each():
-            with self.assertRaisesRegex(of_bench.BenchError, "compiled chunk"):
-                of_bench.evaluate({"x.lua": "\x1bLua"}, "x.lua", of_bench.NO_WORDS, limits=FAST)
-            with self.assertRaisesRegex(of_bench.BenchError, "compiled chunk"):
+            with self.assertRaisesRegex(bench.BenchError, "compiled chunk"):
+                bench.evaluate({"x.lua": "\x1bLua"}, "x.lua", bench.NO_WORDS, limits=FAST)
+            with self.assertRaisesRegex(bench.BenchError, "compiled chunk"):
                 self.read('return require("lib.b")', files={"lib/b.lua": "\x1bLJ"})
 
     # a loop that does not end
@@ -367,9 +367,8 @@ class _Project(unittest.TestCase):
             self.skipTest("no Lua runtime on this machine")
         self.tmp = tempfile.mkdtemp()
         self.state = os.path.join(self.tmp, "state")
-        import of_events
-        self._saved = of_events.STATE_DIR
-        of_events.STATE_DIR = self.state
+        self._saved = bench.STATE_DIR
+        bench.STATE_DIR = self.state
         self.upstream = os.path.join(self.tmp, "demo-asks")
         os.makedirs(self.upstream)
         write(self.upstream, PKG)
@@ -383,12 +382,11 @@ class _Project(unittest.TestCase):
         self.logs = []
 
     def tearDown(self):
-        import of_events
-        of_events.STATE_DIR = self._saved
+        bench.STATE_DIR = self._saved
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def install(self, **kw):
-        return of_bench.install(self.org, log=self.logs.append, **kw)
+        return bench.install(self.org, log=self.logs.append, **kw)
 
 
 class LockTest(_Project):
@@ -400,24 +398,24 @@ class LockTest(_Project):
         head = git(self.upstream, "rev-parse", "HEAD")
         self.assertEqual(e["source"]["commit"], head)
         self.assertTrue(e["digest"].startswith("sha256:"))
-        lock = of_bench.read_lock(self.org)                     # the lock is Lua, read back by the closed reader
+        lock = bench.read_lock(self.org)                     # the lock is Lua, read back by the closed reader
         self.assertEqual(lock["demo-asks"]["source"]["commit"], head)
         self.assertEqual(lock["demo-asks"]["digest"], e["digest"])
         self.assertIn("main.lua", lock["demo-asks"]["files"])
 
     def test_a_second_install_from_the_lock_gives_the_same_files(self):
         self.install()
-        before = of_bench.folder_files(os.path.join(self.org, ".bench", "packages", "demo-asks"))
-        with open(os.path.join(self.org, of_bench.LOCK)) as f:
+        before = bench.folder_files(os.path.join(self.org, ".bench", "packages", "demo-asks"))
+        with open(os.path.join(self.org, bench.LOCK)) as f:
             lock_text = f.read()
         # the source moves on; the lock holds the install where it was
         write(self.upstream, {"lib/routing.lua": 'return { to = function(q) return "finance" end }\n'})
         git(self.upstream, "commit", "-qam", "1.1.0")
         shutil.rmtree(os.path.join(self.org, ".bench"))
         self.install(frozen=True)
-        after = of_bench.folder_files(os.path.join(self.org, ".bench", "packages", "demo-asks"))
+        after = bench.folder_files(os.path.join(self.org, ".bench", "packages", "demo-asks"))
         self.assertEqual(before, after)
-        with open(os.path.join(self.org, of_bench.LOCK)) as f:
+        with open(os.path.join(self.org, bench.LOCK)) as f:
             self.assertEqual(f.read(), lock_text)
 
     def test_a_changed_file_is_noticed(self):
@@ -425,9 +423,9 @@ class LockTest(_Project):
         p = os.path.join(self.org, ".bench", "packages", "demo-asks", "lib", "routing.lua")
         with open(p, "a") as f:
             f.write("-- changed\n")
-        self.assertEqual(of_bench.check(self.org), [("demo-asks", "lib/routing.lua", "changed")])
+        self.assertEqual(bench.check(self.org), [("demo-asks", "lib/routing.lua", "changed")])
         os.remove(os.path.join(self.org, ".bench", "packages", "demo-asks", "main.lua"))
-        self.assertIn(("demo-asks", "main.lua", "removed"), of_bench.check(self.org))
+        self.assertIn(("demo-asks", "main.lua", "removed"), bench.check(self.org))
 
     def test_a_path_source_has_a_digest_and_a_change_is_noticed(self):
         local = os.path.join(self.org, "methods", "demo-asks")
@@ -436,17 +434,17 @@ class LockTest(_Project):
         e = self.install()["demo-asks"]
         self.assertEqual(e["source"], {"path": "methods/demo-asks"})
         self.assertTrue(e["digest"].startswith("sha256:"))
-        self.assertEqual(of_bench.check(self.org), [])
+        self.assertEqual(bench.check(self.org), [])
         write(local, {"main.lua": PKG["main.lua"] + "\n-- the organization's line\n"})
-        self.assertEqual(of_bench.check(self.org), [("demo-asks", "main.lua", "changed")])
-        with self.assertRaisesRegex(of_bench.BenchError, "main.lua changed since the lock"):
+        self.assertEqual(bench.check(self.org), [("demo-asks", "main.lua", "changed")])
+        with self.assertRaisesRegex(bench.BenchError, "main.lua changed since the lock"):
             self.install(frozen=True)
 
     def test_a_link_in_a_package_is_refused(self):
         os.symlink("/etc/hosts", os.path.join(self.upstream, "hosts"))
         git(self.upstream, "add", "hosts")
         git(self.upstream, "commit", "-qm", "a link")
-        with self.assertRaisesRegex(of_bench.BenchError, "a link in a package"):
+        with self.assertRaisesRegex(bench.BenchError, "a link in a package"):
             self.install()
 
 
@@ -457,7 +455,7 @@ class SettingsTest(_Project):
         self.install()
         self.assertEqual(of_method.settings(self.org, "demo-asks"), {"language": "en", "escalate_after": 7200})
         write(self.org, {"config/settings/demo-asks.lua": 'return { language = "ru", escalate_after = "4h" }\n'})
-        with self.assertRaisesRegex(of_bench.BenchError, "changed since the install"):
+        with self.assertRaisesRegex(bench.BenchError, "changed since the install"):
             of_method.settings(self.org, "demo-asks")               # a value nobody checked never acts
         self.install()
         self.assertEqual(of_method.settings(self.org, "demo-asks"), {"language": "ru", "escalate_after": 14400})
@@ -469,9 +467,9 @@ class SettingsTest(_Project):
                            ('return { language = true }', 'language is true, not a language code'),
                            ('return { colour = "red" }', '"colour" is no setting of demo-asks')):
             write(self.org, {"config/settings/demo-asks.lua": text + "\n"})
-            with self.assertRaisesRegex(of_bench.BenchError, said):
+            with self.assertRaisesRegex(bench.BenchError, said):
                 self.install()
-            self.assertFalse(os.path.exists(os.path.join(self.org, of_bench.LOCK)))   # nothing locked
+            self.assertFalse(os.path.exists(os.path.join(self.org, bench.LOCK)))   # nothing locked
 
 
 class HookTest(_Project):
@@ -503,16 +501,16 @@ class HookTest(_Project):
 
     def test_no_hook_means_no_reader_at_work(self):
         self.install()
-        saved, entries = of_bench.evaluate, []
+        saved, entries = bench.evaluate, []
 
         def counted(files, entry, *a, **k):
             entries.append(entry)
             return saved(files, entry, *a, **k)
-        of_bench.evaluate = counted
+        bench.evaluate = counted
         try:
             self.assertEqual(of_method.before(self.org, "demo-asks", "file", {}), {"decision": "pass", "by": None})
         finally:
-            of_bench.evaluate = saved
+            bench.evaluate = saved
         self.assertEqual(entries, ["file.lua"])                    # the lock alone: no hook file evaluated
 
     def test_a_changed_or_failing_hook_stops_the_module(self):
@@ -545,7 +543,7 @@ class HookTest(_Project):
                             'written_for = "demo-asks 1"'),
                            ('before "file" { written_for = "demo-asks 1" }', "needs run = function")):
             write(self.org, {"extensions/demo-asks/h.lua": text + "\n"})
-            with self.assertRaisesRegex(of_bench.BenchError, said):
+            with self.assertRaisesRegex(bench.BenchError, said):
                 self.install()
 
 
@@ -555,10 +553,10 @@ class ForkTest(_Project):
 
     def test_fork_commit_upgrade_rebase_and_tests(self):
         self.install()
-        dest = of_bench.fork(self.org, "demo-asks", log=self.logs.append)
+        dest = bench.fork(self.org, "demo-asks", log=self.logs.append)
         self.assertEqual(git(dest, "remote", "get-url", "origin"), "file://" + self.upstream)
-        self.assertEqual(git(dest, "rev-parse", "--abbrev-ref", "HEAD"), of_bench.FORK_BRANCH)
-        self.assertEqual(of_bench.read_benchfile(self.org)[0]["source"], {"path": "forks/demo-asks"})
+        self.assertEqual(git(dest, "rev-parse", "--abbrev-ref", "HEAD"), bench.FORK_BRANCH)
+        self.assertEqual(bench.read_benchfile(self.org)[0]["source"], {"path": "forks/demo-asks"})
         # the organization's commit
         write(dest, {"lib/routing.lua": 'return { to = function(q) return q.to or "finance" end }\n'})
         git(dest, "commit", "-qam", "route to finance by default")
@@ -567,26 +565,26 @@ class ForkTest(_Project):
         write(self.upstream, {"Benchfile.spec": spec, "README.md": "1.1.0\n"})
         git(self.upstream, "add", "-A")
         git(self.upstream, "commit", "-qm", "1.1.0")
-        r = of_bench.rebase(self.org, "demo-asks", identity=("t", "t@example.invalid"), log=self.logs.append)
+        r = bench.rebase(self.org, "demo-asks", identity=("t", "t@example.invalid"), log=self.logs.append)
         self.assertTrue(r["rebased"])
-        self.assertEqual(of_bench.read_spec(dest)["version"], "1.1.0")
+        self.assertEqual(bench.read_spec(dest)["version"], "1.1.0")
         with open(os.path.join(dest, "lib", "routing.lua")) as f:
             self.assertIn("finance", f.read())
         self.assertEqual(r["tests"]["exit"], 0)
         self.assertEqual(r["tests"]["held"], ["a card has a decision", "routing is required"])
         self.install()                                              # the lock takes the fork as a path
-        self.assertEqual(of_bench.read_lock(self.org)["demo-asks"]["version"], "1.1.0")
+        self.assertEqual(bench.read_lock(self.org)["demo-asks"]["version"], "1.1.0")
 
     def test_the_tests_say_what_no_longer_holds(self):
         self.install()
-        dest = of_bench.fork(self.org, "demo-asks", log=self.logs.append)
+        dest = bench.fork(self.org, "demo-asks", log=self.logs.append)
         write(dest, {"main.lua": PKG["main.lua"].replace("local routing", "local route")
                      .replace("routing.to", "route.to")})
         git(dest, "commit", "-qam", "rename")
         write(self.upstream, {"README.md": "1.0.1\n"})
         git(self.upstream, "add", "-A")
         git(self.upstream, "commit", "-qm", "1.0.1")
-        r = of_bench.rebase(self.org, "demo-asks", identity=("t", "t@example.invalid"), log=self.logs.append)
+        r = bench.rebase(self.org, "demo-asks", identity=("t", "t@example.invalid"), log=self.logs.append)
         self.assertTrue(r["rebased"])
         self.assertNotEqual(r["tests"]["exit"], 0)
         self.assertEqual(r["tests"]["broke"], ["routing is required"])
@@ -594,12 +592,12 @@ class ForkTest(_Project):
 
     def test_a_conflict_is_left_for_the_person(self):
         self.install()
-        dest = of_bench.fork(self.org, "demo-asks", log=self.logs.append)
+        dest = bench.fork(self.org, "demo-asks", log=self.logs.append)
         write(dest, {"lib/routing.lua": 'return { to = function(q) return "a" end }\n'})
         git(dest, "commit", "-qam", "ours")
         write(self.upstream, {"lib/routing.lua": 'return { to = function(q) return "b" end }\n'})
         git(self.upstream, "commit", "-qam", "theirs")
-        r = of_bench.rebase(self.org, "demo-asks", identity=("t", "t@example.invalid"), log=self.logs.append)
+        r = bench.rebase(self.org, "demo-asks", identity=("t", "t@example.invalid"), log=self.logs.append)
         self.assertEqual((r["rebased"], r["conflicts"]), (False, ["lib/routing.lua"]))
         self.assertTrue(any("git rebase --abort" in x for x in self.logs))
 

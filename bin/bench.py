@@ -1,8 +1,8 @@
-"""Bench, the package manager under OF (docs/bench.md; organic-framework-build reports/framework/metamethod,
+"""Bench, the package manager (docs/bench.md; organic-framework-build reports/framework/metamethod,
 11-first-slice.md, parts 1, 2 and 6).
 
 Bench knows a package, its version, where it came from and what it depends on. It reads `Benchfile.spec`,
-`Benchfile` and `Benchfile.lock` in a closed Lua environment (bin/of_bench_sandbox.lua, run in a process of its own),
+`Benchfile` and `Benchfile.lock` in a closed Lua environment (bin/bench_sandbox.lua, run in a process of its own),
 fetches a package from git or takes it from a path, writes the lock, notices a changed file, and forks a package as
 a git clone that is rebased on its origin. What a package's `main.lua` means is its framework's (OF's is
 bin/of_method.py), called at install through FRAMEWORK below.
@@ -20,7 +20,7 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SANDBOX = os.path.join(HERE, "of_bench_sandbox.lua")
+SANDBOX = os.path.join(HERE, "bench_sandbox.lua")
 
 LOCK = "Benchfile.lock"
 BENCHFILE = "Benchfile"
@@ -368,7 +368,7 @@ def read_lock(project):
 
 
 def write_lock(project, entries):
-    lines = ["-- Benchfile.lock: written by `of bench install`, read by Bench's closed reader. Do not edit it by hand:",
+    lines = ["-- Benchfile.lock: written by `bench install`, read by Bench's closed reader. Do not edit it by hand:",
              "-- each package's exact version, its source (for git the commit), and a digest of every file.",
              "", "lockfile { version = 1 }", ""]
     for name in sorted(entries):
@@ -400,27 +400,64 @@ def _pretty(v, depth):
 
 # ---- git sources ----
 
+STATE_DIR = None   # Bench's own state (its git caches); BENCH_STATE, else $XDG_STATE_HOME/bench, else ~/.local/state/bench
+
+
 def _state_dir():
-    import of_events
-    return of_events.STATE_DIR
+    if STATE_DIR:
+        return STATE_DIR
+    if os.environ.get("BENCH_STATE"):
+        return os.environ["BENCH_STATE"]
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "bench")
+
+
+SYSTEM_GIT = "/usr/bin/git"
+# every hook event of githooks(5): a hook a repository's configuration names (hook.<name>.command and .event) runs
+# whatever core.hooksPath says, and from git 2.55 hook.<event>.enabled=false turns every hook of that event off
+# (git-config(1)); taken from organic-framework bin/of_protected.py, where the guard's keeper reviewed it
+HOOK_EVENTS = ("applypatch-msg", "commit-msg", "fsmonitor-watchman", "p4-changelist", "p4-post-changelist",
+               "p4-pre-submit", "p4-prepare-changelist", "post-applypatch", "post-checkout", "post-commit",
+               "post-index-change", "post-merge", "post-receive", "post-rewrite", "post-update", "pre-applypatch",
+               "pre-auto-gc", "pre-commit", "pre-merge-commit", "pre-push", "pre-rebase", "pre-receive",
+               "prepare-commit-msg", "proc-receive", "push-to-checkout", "reference-transaction", "sendemail-validate",
+               "update")
+
+
+def _git_env():
+    """git's environment: no system or global configuration (the caller's HOME is not read), no replace objects, no
+    graft file, no lazy fetch, no prompt, and no transport (a fetch opens its own)."""
+    return {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1", "GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0", "GIT_GRAFT_FILE": "/dev/null", "GIT_ALLOW_PROTOCOL": ""}
+
+
+def _git_cmd(tree):
+    """The system's git in TREE with every setting that keeps a package's repository from running a program of its
+    own: fsmonitor, hooks, an external diff, a pager, automatic maintenance."""
+    if not os.path.isfile(SYSTEM_GIT):
+        raise BenchError(f"no system git ({SYSTEM_GIT}) on this machine")
+    hooks = [x for ev in HOOK_EVENTS for x in ("-c", f"hook.{ev}.enabled=false")]
+    return [SYSTEM_GIT, "-C", tree, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", *hooks,
+            "-c", "diff.external=", "-c", "core.pager=cat", "-c", "protocol.allow=never", "-c", "gc.auto=0",
+            "-c", "maintenance.auto=false", "-c", "diff.ignoreSubmodules=none", "-c", "submodule.recurse=false",
+            "-c", "core.commitGraph=false", "-c", "core.alternateRefsCommand="]
 
 
 def _git(tree, *args, timeout=300, transport=False, check=True):
-    """The system's git with no program the repository names (of_protected); TRANSPORT opens https, ssh and file for
-    a fetch or a clone, which of_protected keeps closed."""
-    import of_protected
-    env = of_protected._env()
+    """The system's git with no program the repository names; TRANSPORT opens https, ssh and file for a fetch or a
+    clone, which are closed otherwise."""
+    env = _git_env()
     if transport:
         env["GIT_ALLOW_PROTOCOL"] = "https:ssh:file"
-    r = subprocess.run(of_protected._git_cmd(tree) + list(args), capture_output=True, text=True, timeout=timeout,
-                       env=env)
+    r = subprocess.run(_git_cmd(tree) + list(args), capture_output=True, text=True, timeout=timeout, env=env)
     if check and r.returncode != 0:
         raise BenchError(f"git {args[0]}: {(r.stderr or r.stdout).strip()[:300]}")
     return r
 
 
 def _cache(url):
-    d = os.path.join(_state_dir(), "bench", "git", hashlib.sha256(url.encode()).hexdigest()[:24] + ".git")
+    d = os.path.join(_state_dir(), "git", hashlib.sha256(url.encode()).hexdigest()[:24] + ".git")
     if not os.path.isdir(d):
         os.makedirs(d, mode=0o700)
         _git(d, "init", "--quiet", "--bare")
@@ -468,8 +505,8 @@ def export(cache, commit, sub, dest):
         if kind != "blob" or mode not in ("100644", "100755"):
             raise BenchError(f"{path}: a {'link' if mode == '120000' else kind} in a package")
         rel = _rel(rel, "a file of the package")
-        data = subprocess.run(__import__("of_protected")._git_cmd(cache) + ["cat-file", "blob", oid],
-                              capture_output=True, timeout=60, env=__import__("of_protected")._env()).stdout
+        data = subprocess.run(_git_cmd(cache) + ["cat-file", "blob", oid], capture_output=True, timeout=60,
+                              env=_git_env()).stdout
         target = os.path.join(dest, rel)
         os.makedirs(os.path.dirname(target), exist_ok=True)
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
@@ -578,7 +615,7 @@ def check(project):
     project = os.path.abspath(project)
     lock = read_lock(project)
     if not lock:
-        raise BenchError(f"{project}: no {LOCK}; run of bench install")
+        raise BenchError(f"{project}: no {LOCK}; run bench install")
     out = []
     pkgs = {p["name"]: p for p in read_benchfile(project)}
     for name in sorted(set(lock) | set(pkgs)):
@@ -614,7 +651,7 @@ def fork(project, name, log=print):
         raise BenchError(f"\"{name}\" comes from a path, not git: it is already the organization's own folder")
     commit = ((read_lock(project).get(name) or {}).get("source") or {}).get("commit")
     if not commit:
-        raise BenchError(f"\"{name}\" is not installed: run of bench install first")
+        raise BenchError(f"\"{name}\" is not installed: run bench install first")
     dest = os.path.join(project, FORKS, name)
     if os.path.exists(dest):
         raise BenchError(f"{FORKS}/{name} exists already")
@@ -653,7 +690,7 @@ def rebase(project, name, onto=None, identity=None, log=print):
     project = os.path.abspath(project)
     dest = os.path.join(project, FORKS, name)
     if not os.path.isdir(os.path.join(dest, ".git")):
-        raise BenchError(f"no fork {FORKS}/{name}: of bench fork {name} makes one")
+        raise BenchError(f"no fork {FORKS}/{name}: bench fork {name} makes one")
     _git(dest, "fetch", "--quiet", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*",
          "+refs/tags/*:refs/tags/*", transport=True)
     ref = onto or _git(dest, "config", "bench.upstream", check=False).stdout.strip() or "HEAD"
@@ -675,7 +712,7 @@ def rebase(project, name, onto=None, identity=None, log=print):
         log(f"the rebase stopped on a conflict in {', '.join(conflicts) or 'the fork'}; in {FORKS}/{name}: resolve "
             f"it and `git rebase --continue`, or `git rebase --abort` to go back")
         return {"rebased": False, "conflicts": conflicts, "tests": None}
-    log(f"{FORKS}/{name}: rebased on {ref} ({target[:12]}); run of bench install to lock the new content")
+    log(f"{FORKS}/{name}: rebased on {ref} ({target[:12]}); run bench install to lock the new content")
     pkg = {p["name"]: p for p in read_benchfile(project)}.get(name)
     folder = package_dir(project, pkg) if pkg and "path" in pkg["source"] else dest
     return {"rebased": True, "conflicts": [], "tests": run_tests(folder, log=log)}
@@ -728,12 +765,6 @@ def run_tests(folder, timeout=900, log=print):
 def project_of(args):
     if getattr(args, "project", None):
         return os.path.abspath(args.project)
-    if getattr(args, "org", None):
-        import of_protected
-        for e in of_protected.entries():
-            if e.get("org") == args.org and e.get("path"):
-                return os.path.expanduser(e["path"])
-        raise BenchError(f"orgs.yaml gives no path for {args.org}")
     return os.getcwd()
 
 
@@ -741,7 +772,7 @@ def main(args):
     try:
         return _main(args)
     except BenchError as e:
-        print(f"of bench: {e}", file=sys.stderr)
+        print(f"bench: {e}", file=sys.stderr)
         return 1
 
 
@@ -814,7 +845,6 @@ def add_parser(sub):
                    ("hook", "call the organization's hooks before a module with a sample input, as the package would")):
         p = bs.add_parser(cmd, help=h)
         p.add_argument("--project", help="the organization's project folder (default: here)")
-        p.add_argument("--org", help="the organization, whose path orgs.yaml gives")
         if cmd == "install":
             p.add_argument("--frozen", action="store_true", help="install exactly what the lock holds")
         if cmd in ("fork", "rebase", "test", "settings", "hook"):
@@ -828,3 +858,13 @@ def add_parser(sub):
     r.add_argument("file")
     r.add_argument("--words", default="none", choices=("spec", "benchfile", "lock", "method", "hook", "none"))
     return b
+
+
+if __name__ == "__main__":
+    import argparse
+
+    class _Top:
+        """add_parser's SUB for the command of its own: the one parser, named bench"""
+        def add_parser(self, name, help=None):
+            return argparse.ArgumentParser(prog="bench", description="Bench, the package manager (docs/bench.md)")
+    sys.exit(main(add_parser(_Top()).parse_args()))
