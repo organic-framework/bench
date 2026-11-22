@@ -5,7 +5,7 @@ Bench knows a package, its version, where it came from and what it depends on. I
 `Benchfile` and `Benchfile.lock` in a closed Lua environment (bin/bench_sandbox.lua, run in a process of its own),
 fetches a package from git or takes it from a path, writes the lock, notices a changed file, and forks a package as
 a git clone that is rebased on its origin. What a package's `main.lua` means is its framework's (OF's is
-bin/of_method.py), called at install through FRAMEWORK below.
+organic-framework's bin/of_method.py), which the caller hands in as FRAMEWORK below; plain `bench` has none.
 
 Sources in this slice: git and a path. No catalogue, no version resolution between packages.
 """
@@ -218,16 +218,15 @@ def _read_text(p):
 
 # ---- digests ----
 
-SKIP_DIRS = {".git", ".bench", "__pycache__"}
-
-
 def _walk(folder):
-    """Every regular file under FOLDER, relative, sorted; a link anywhere is refused (a package's content is its own
-    files, never what a link points at)."""
+    """Every regular file under FOLDER, relative, sorted, but for the folder's own .git (a fork's or a path package's
+    repository); a link anywhere is refused (a package's content is its own files, never what a link points at).
+    Every other folder counts, __pycache__ and .bench included: a file Python or anyone may load is part of the
+    package (of_bench's review, 2026-11-23: a .pyc added under __pycache__ passed check and --frozen)."""
     out = []
     for root, dirs, names in os.walk(folder):
         for d in list(dirs):
-            if d in SKIP_DIRS:
+            if d == ".git" and root == folder:
                 dirs.remove(d)
             elif os.path.islink(os.path.join(root, d)):
                 raise BenchError(f"{os.path.relpath(os.path.join(root, d), folder)}: a link in a package")
@@ -241,10 +240,14 @@ def _walk(folder):
     return sorted(out)
 
 
-def file_digest(path):
+def file_digest(path, mode=False):
+    """sha256 of the file's bytes; with MODE, a file that may be executed is marked in the digest too (a package's
+    files: a chmod +x is a change)."""
     h = hashlib.sha256()
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(fd, "rb") as f:
+        if mode and os.fstat(f.fileno()).st_mode & 0o111:
+            h.update(b"executable\0")
         for chunk in iter(lambda: f.read(1 << 16), b""):
             h.update(chunk)
     return "sha256:" + h.hexdigest()
@@ -259,7 +262,7 @@ def tree_digest(files):
 
 
 def folder_files(folder):
-    return {rel: file_digest(os.path.join(folder, rel)) for rel in _walk(folder)}
+    return {rel: file_digest(os.path.join(folder, rel), mode=True) for rel in _walk(folder)}
 
 
 def changed(locked_files, now_files):
@@ -457,6 +460,7 @@ def _git(tree, *args, timeout=300, transport=False, check=True):
 
 
 def _cache(url):
+    """URL as git takes it (_url): a relative folder is keyed by where it is, not by how one project wrote it."""
     d = os.path.join(_state_dir(), "git", hashlib.sha256(url.encode()).hexdigest()[:24] + ".git")
     if not os.path.isdir(d):
         os.makedirs(d, mode=0o700)
@@ -474,14 +478,22 @@ def _url(url, project):
     return "file://" + os.path.abspath(p)
 
 
-def fetch(url, project):
-    cache = _cache(url)
-    _git(cache, "fetch", "--quiet", "--no-tags", "--prune", "--end-of-options", _url(url, project),
+def fetch(url, project, ref=None):
+    """The source's branches and tags into its cache; with REF "HEAD", also the commit the source's HEAD names, kept
+    as refs/bench/HEAD (a bare cache's own HEAD names no branch the fetch brings)."""
+    full = _url(url, project)
+    cache = _cache(full)
+    _git(cache, "fetch", "--quiet", "--no-tags", "--prune", "--end-of-options", full,
          "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*", transport=True)
+    if ref == "HEAD":
+        _git(cache, "fetch", "--quiet", "--no-tags", "--end-of-options", full, "+HEAD:refs/bench/HEAD",
+             transport=True)
     return cache
 
 
 def resolve(cache, ref):
+    if ref == "HEAD":
+        ref = "refs/bench/HEAD"
     r = _git(cache, "rev-parse", "--verify", "--quiet", "--end-of-options", f"{ref}^{{commit}}", check=False)
     if r.returncode != 0:
         raise BenchError(f"no commit for {ref!r} in the source")
@@ -505,8 +517,11 @@ def export(cache, commit, sub, dest):
         if kind != "blob" or mode not in ("100644", "100755"):
             raise BenchError(f"{path}: a {'link' if mode == '120000' else kind} in a package")
         rel = _rel(rel, "a file of the package")
-        data = subprocess.run(_git_cmd(cache) + ["cat-file", "blob", oid], capture_output=True, timeout=60,
-                              env=_git_env()).stdout
+        r = subprocess.run(_git_cmd(cache) + ["cat-file", "blob", oid], capture_output=True, timeout=60,
+                           env=_git_env())
+        if r.returncode != 0:
+            raise BenchError(f"git cat-file {oid[:12]} ({path}): {r.stderr.decode(errors='replace').strip()[:200]}")
+        data = r.stdout
         target = os.path.join(dest, rel)
         os.makedirs(os.path.dirname(target), exist_ok=True)
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
@@ -520,14 +535,24 @@ def export(cache, commit, sub, dest):
 
 # ---- install ----
 
-FRAMEWORK = None   # set by the framework that reads main.lua (bin/of_method.py); called at install
+# The framework that reads main.lua, set by its caller (`of bench` sets organic-framework's of_method.on_install):
+# FRAMEWORK(project, name, folder, spec) is called at install for what the lock records beside Bench's own. Its module
+# may also give check(project), before(project, package, module, input), settings(project, package), METHOD_WORDS and
+# HOOK_WORDS, which `bench check`, `hook`, `settings` and `read --words method|hook` use. With none, Bench installs
+# packages and knows nothing of their methods.
+FRAMEWORK = None
 
 
 def _framework():
-    if FRAMEWORK is not None:
-        return FRAMEWORK
-    import of_method
-    return of_method.on_install
+    return FRAMEWORK or (lambda project, name, folder, spec: {})
+
+
+def _framework_module(what):
+    mod = sys.modules.get(getattr(FRAMEWORK, "__module__", None) or "") if FRAMEWORK else None
+    if mod is None:
+        raise BenchError(f"{what} is a framework's: run it through the framework that reads the packages' main.lua "
+                         f"(of bench {what})")
+    return mod
 
 
 def package_dir(project, pkg, lock_entry=None):
@@ -556,8 +581,13 @@ def install(project, frozen=False, log=print):
         if frozen and not prev:
             raise BenchError(f"{LOCK}: no entry for \"{name}\", which the Benchfile names")
         source = dict(src)
+        if frozen:
+            was = {k: v for k, v in (prev.get("source") or {}).items() if k != "commit"}
+            if was != src:
+                raise BenchError(f"\"{name}\": the Benchfile's source differs from the lock's ({_show_src(src)} "
+                                 f"against {_show_src(was)}); run bench install to lock the new source")
         if "git" in src:
-            cache = fetch(src["git"], project)
+            cache = fetch(src["git"], project, ref=src["ref"])
             if frozen:
                 commit = (prev.get("source") or {}).get("commit")
                 if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
@@ -602,6 +632,12 @@ def install(project, frozen=False, log=print):
         with open(gi, "w") as f:
             f.write("*\n")
     return entries
+
+
+def _show_src(src):
+    if "path" in src:
+        return f"path {src['path']}"
+    return f"git {src.get('git')} {src.get('ref')}" + (f" dir {src['dir']}" if src.get("dir") else "")
 
 
 def _ensure(d):
@@ -684,9 +720,9 @@ def _replace_line(benchfile, name, line):
     return True
 
 
-def rebase(project, name, onto=None, identity=None, log=print):
+def rebase(project, name, onto=None, identity=None, log=print, tests=True):
     """Rebase the fork forks/<name> on its origin's ONTO (else the ref it was forked from), then run the package's
-    tests. Returns {"rebased": bool, "conflicts": [...], "tests": result or None}."""
+    tests unless TESTS is false (they are the new version's own program: run_tests). Returns {"rebased": bool, "conflicts": [...], "tests": result or None}."""
     project = os.path.abspath(project)
     dest = os.path.join(project, FORKS, name)
     if not os.path.isdir(os.path.join(dest, ".git")):
@@ -715,6 +751,9 @@ def rebase(project, name, onto=None, identity=None, log=print):
     log(f"{FORKS}/{name}: rebased on {ref} ({target[:12]}); run bench install to lock the new content")
     pkg = {p["name"]: p for p in read_benchfile(project)}.get(name)
     folder = package_dir(project, pkg) if pkg and "path" in pkg["source"] else dest
+    if not tests:
+        log(f"the tests were not run; bench test {name} runs them")
+        return {"rebased": True, "conflicts": [], "tests": None}
     return {"rebased": True, "conflicts": [], "tests": run_tests(folder, log=log)}
 
 
@@ -722,7 +761,8 @@ def _identity(project):
     """The person's git name and address, as their own git configuration gives them in the project."""
     vals = []
     for k in ("user.name", "user.email"):
-        r = subprocess.run(["git", "-C", project, "config", "--get", k], capture_output=True, text=True, timeout=10)
+        r = subprocess.run([SYSTEM_GIT, "-C", project, "config", "--get", k], capture_output=True, text=True,
+                           timeout=10)
         if r.returncode != 0 or not r.stdout.strip():
             raise BenchError(f"git has no {k} for this project, which a rebase needs: git config {k} \"…\"")
         vals.append(r.stdout.strip())
@@ -734,15 +774,27 @@ UNITTEST = re.compile(r"^(test\w*) \(([\w.]+)\)(?:\n.*?)? \.\.\. (ok|FAIL|ERROR|
 TAP = re.compile(r"^(not ok|ok)\b\s*\d*\s*-?\s*(.*)$", re.M)
 
 
+# what a package's tests are given of the caller's environment: what finds programs, the language, a place for
+# temporary files, and where the framework and Bench a package's tests run against are (OF_HOME, BENCH_HOME); never
+# the rest, where a token, an agent's socket or a credential may be (of_bench's review, 2026-11-23)
+TEST_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "OF_HOME", "BENCH_HOME")
+
+
 def run_tests(folder, timeout=900, log=print):
     """The package's tests (the spec's `tests`, a command run in its folder), and which of them hold:
-    {"command", "exit", "held": [...], "broke": [...], "tail"}; None when the package names no tests."""
+    {"command", "exit", "held": [...], "broke": [...], "tail"}; None when the package names no tests.
+    The command is the package's own program, from the version in FOLDER (after a rebase, the new upstream's), run
+    as an ordinary process, outside the closed reader, with only TEST_ENV of the environment: it is said before it
+    runs."""
     spec = read_spec(folder)
     if not spec["tests"]:
         log(f"{spec['name']}: its spec names no tests")
         return None
+    log(f"{spec['name']} {spec['version']}: running its tests, a program of the package's own, not in the reader: "
+        f"{' '.join(spec['tests'])}")
+    env = {k: os.environ[k] for k in TEST_ENV if k in os.environ}
     try:
-        r = subprocess.run(spec["tests"], cwd=folder, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(spec["tests"], cwd=folder, capture_output=True, text=True, timeout=timeout, env=env)
         output, code = (r.stdout or "") + (r.stderr or ""), r.returncode
     except (OSError, subprocess.TimeoutExpired) as e:
         output, code = str(e), -1
@@ -780,9 +832,8 @@ def _main(a):
     if a.bench_cmd == "read":
         words = {"spec": SPEC_WORDS, "benchfile": BENCHFILE_WORDS, "lock": LOCK_WORDS, "none": NO_WORDS}
         if a.words in ("method", "hook"):
-            import of_method
-            words = {"method": of_method.METHOD_WORDS, "hook": of_method.HOOK_WORDS}
-            w = words[a.words]
+            fw = _framework_module("read --words " + a.words)
+            w = {"method": fw.METHOD_WORDS, "hook": fw.HOOK_WORDS}[a.words]
         else:
             w = words[a.words]
         folder = os.path.dirname(os.path.abspath(a.file))
@@ -798,8 +849,8 @@ def _main(a):
         return 0
     if a.bench_cmd == "check":
         diffs = check(project)
-        import of_method
-        diffs += of_method.check(project)
+        if FRAMEWORK:
+            diffs += _framework_module("check").check(project)
         for name, rel, how in diffs:
             print(f"{name}: {rel + ' ' if rel else ''}{how}")
         if not diffs:
@@ -809,7 +860,7 @@ def _main(a):
         fork(project, a.package)
         return 0
     if a.bench_cmd == "rebase":
-        r = rebase(project, a.package, onto=a.onto)
+        r = rebase(project, a.package, onto=a.onto, tests=not a.no_tests)
         return 0 if r["rebased"] and (r["tests"] is None or r["tests"]["exit"] == 0) else 1
     if a.bench_cmd == "test":
         pkg = {p["name"]: p for p in read_benchfile(project)}.get(a.package)
@@ -818,17 +869,16 @@ def _main(a):
         r = run_tests(package_dir(project, pkg))
         return 0 if r is None or r["exit"] == 0 else 1
     if a.bench_cmd == "hook":
-        import of_method
+        fw = _framework_module("hook")
         try:
             value = json.loads(a.input)
         except ValueError as e:
             raise BenchError(f"--input is not JSON: {e}")
-        d = of_method.before(project, a.package, a.module, value)
+        d = fw.before(project, a.package, a.module, value)
         print(json.dumps(d, indent=2, ensure_ascii=False))
         return 0 if d["decision"] == "pass" else 2
     if a.bench_cmd == "settings":
-        import of_method
-        print(json.dumps(of_method.settings(project, a.package), indent=2, ensure_ascii=False))
+        print(json.dumps(_framework_module("settings").settings(project, a.package), indent=2, ensure_ascii=False))
         return 0
     raise BenchError(f"unknown command {a.bench_cmd}")
 
@@ -854,6 +904,8 @@ def add_parser(sub):
             p.add_argument("--input", required=True, help="the module's input as JSON, such as a card")
         if cmd == "rebase":
             p.add_argument("--onto", help="the origin's branch or tag (default: the one forked from)")
+            p.add_argument("--no-tests", action="store_true",
+                           help="do not run the new version's tests, a program of the package's own, after the rebase")
     r = bs.add_parser("read", help="evaluate one file in the closed reader and print its data")
     r.add_argument("file")
     r.add_argument("--words", default="none", choices=("spec", "benchfile", "lock", "method", "hook", "none"))

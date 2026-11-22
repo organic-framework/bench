@@ -15,7 +15,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "bin"))
 
 import bench  # noqa: E402
-import of_method  # noqa: E402
+
+# main.lua's words as a framework gives them (OF's are organic-framework's bin/of_method.py): the reader takes any
+METHOD_WORDS = {"decl": ["roles", "subject", "setting", "module", "extendable", "event"],
+                "value": ["skill", "tool", "command", "record", "schedule", "turn_end", "act", "role", "classifier"]}
 
 FAST = {"instructions": 2_000_000}
 
@@ -181,7 +184,7 @@ class ReaderExamplesTest(_EachRuntime):
 
     def test_the_method_with_its_lib_files(self):
         for _ in self.each():
-            r = self.read(MAIN_10, of_method.METHOD_WORDS, files=LIB_10)
+            r = self.read(MAIN_10, METHOD_WORDS, files=LIB_10)
             mods = {d["name"]: d["body"] for d in r["decls"] if d["word"] == "module"}
             self.assertEqual(len(mods), 10)                                   # ten modules
             self.assertEqual(mods["file"]["on"], {"@": "command", "args": ["ask"]})
@@ -215,7 +218,7 @@ class ReaderExamplesTest(_EachRuntime):
     def test_an_unknown_word_is_refused(self):
         for _ in self.each():
             with self.assertRaisesRegex(bench.BenchError, 'unknown name "modul"'):
-                self.read('modul "x" {}', of_method.METHOD_WORDS)
+                self.read('modul "x" {}', METHOD_WORDS)
 
 
 class ReaderHostileTest(_EachRuntime):
@@ -474,103 +477,44 @@ class LockTest(_Project):
             self.install()
 
 
-class SettingsTest(_Project):
-    """The mechanism of part 4: the install reads config/settings/<package>.lua against the method's types."""
+    # of_bench's review, 2026-11-23
+    def test_a_package_without_ref_takes_the_source_HEAD_on_main(self):
+        write(self.org, {"Benchfile": f'package("demo-asks", {{ git = "{self.upstream}" }})\n'})
+        e = self.install()["demo-asks"]
+        self.assertEqual(e["source"]["commit"], git(self.upstream, "rev-parse", "HEAD"))
 
-    def test_a_value_changes_what_the_package_reads(self):
+    def test_an_executable_bit_and_a_file_in_pycache_are_noticed(self):
+        local = os.path.join(self.org, "methods", "demo-asks")
+        shutil.copytree(self.upstream, local, ignore=shutil.ignore_patterns(".git"))
+        write(self.org, {"Benchfile": 'package("demo-asks", { path = "methods/demo-asks" })\n'})
         self.install()
-        self.assertEqual(of_method.settings(self.org, "demo-asks"), {"language": "en", "escalate_after": 7200})
-        write(self.org, {"config/settings/demo-asks.lua": 'return { language = "ru", escalate_after = "4h" }\n'})
-        with self.assertRaisesRegex(bench.BenchError, "changed since the install"):
-            of_method.settings(self.org, "demo-asks")               # a value nobody checked never acts
+        os.chmod(os.path.join(local, "main.lua"), 0o755)
+        self.assertEqual(bench.check(self.org), [("demo-asks", "main.lua", "changed")])
+        os.chmod(os.path.join(local, "main.lua"), 0o644)
+        write(local, {"lib/__pycache__/routing.cpython-314.pyc": "planted"})
+        self.assertEqual(bench.check(self.org), [("demo-asks", "lib/__pycache__/routing.cpython-314.pyc", "added")])
+        with self.assertRaisesRegex(bench.BenchError, "since the lock"):
+            self.install(frozen=True)
+
+    def test_frozen_refuses_a_source_that_differs_from_the_lock(self):
         self.install()
-        self.assertEqual(of_method.settings(self.org, "demo-asks"), {"language": "ru", "escalate_after": 14400})
-        self.assertEqual(of_method.settings(self.org, "demo-asks", parsed=False)["escalate_after"], "4h")
+        other = os.path.join(self.tmp, "elsewhere")
+        shutil.copytree(self.upstream, other)
+        write(self.org, {"Benchfile": f'package("demo-asks", {{ git = "{other}", ref = "main" }})\n'})
+        with self.assertRaisesRegex(bench.BenchError, "source differs from the lock"):
+            self.install(frozen=True)
 
-    def test_a_value_of_the_wrong_type_is_refused_at_install(self):
-        for text, said in (('return { escalate_after = 4 }', 'escalate_after is 4, not a duration'),
-                           ('return { escalate_after = "soon" }', 'escalate_after is "soon", not a duration'),
-                           ('return { language = true }', 'language is true, not a language code'),
-                           ('return { colour = "red" }', '"colour" is no setting of demo-asks')):
-            write(self.org, {"config/settings/demo-asks.lua": text + "\n"})
-            with self.assertRaisesRegex(bench.BenchError, said):
-                self.install()
-            self.assertFalse(os.path.exists(os.path.join(self.org, bench.LOCK)))   # nothing locked
-
-
-class HookTest(_Project):
-    """The mechanism of part 5: a hook before a module returns a decision, and the record can name the hook."""
-
-    HOOK = '''
-        before "file" {
-          written_for = "demo-asks 1",
-          run = function(card, ctx)
-            for _, t in ipairs(card.tags or {}) do
-              if t == "money" then return { decision = "stop", reason = "money cards go to finance first" } end
-            end
-            return "pass"
-          end,
-        }
-        '''
-
-    def test_a_hook_stops_a_card_with_a_tag_and_passes_the_rest(self):
-        write(self.org, {"extensions/demo-asks/finance-review.lua": self.HOOK})
-        self.install()
-        d = of_method.before(self.org, "demo-asks", "file", {"title": "pay", "tags": ["money"]})
-        self.assertEqual(d["decision"], "stop")
-        self.assertEqual(d["reason"], "money cards go to finance first")
-        self.assertEqual(d["by"], 'extensions/demo-asks/finance-review.lua: before "file"')
-        self.assertEqual(of_method.before(self.org, "demo-asks", "file", {"tags": ["infra"]}),
-                         {"decision": "pass", "by": None})
-        self.assertEqual(of_method.before(self.org, "demo-asks", "write-card", {"tags": ["money"]})["decision"],
-                         "pass")
-
-    def test_no_hook_means_no_reader_at_work(self):
-        self.install()
-        saved, entries = bench.evaluate, []
-
-        def counted(files, entry, *a, **k):
-            entries.append(entry)
-            return saved(files, entry, *a, **k)
-        bench.evaluate = counted
+    def test_the_tests_get_only_a_short_environment(self):
+        write(self.upstream, {"Benchfile.spec": PKG["Benchfile.spec"],
+                              "tests/run.sh": 'if [ -n "${BENCH_PROBE_SECRET:-}" ]; then echo "not ok 1 - env"; '
+                                              'exit 1; fi\necho "ok 1 - env"\n'})
+        os.environ["BENCH_PROBE_SECRET"] = "x"
         try:
-            self.assertEqual(of_method.before(self.org, "demo-asks", "file", {}), {"decision": "pass", "by": None})
+            r = bench.run_tests(self.upstream, log=self.logs.append)
         finally:
-            bench.evaluate = saved
-        self.assertEqual(entries, ["file.lua"])                    # the lock alone: no hook file evaluated
-
-    def test_a_changed_or_failing_hook_stops_the_module(self):
-        p = os.path.join(self.org, "extensions", "demo-asks", "finance-review.lua")
-        write(self.org, {"extensions/demo-asks/finance-review.lua": self.HOOK})
-        self.install()
-        with open(p, "a") as f:
-            f.write("-- edited after the install\n")
-        d = of_method.before(self.org, "demo-asks", "file", {"tags": []})
-        self.assertEqual((d["decision"], "changed since the install" in d["reason"]), ("stop", True))
-        self.assertIn(("demo-asks", "extensions/demo-asks/finance-review.lua", "changed since the install"),
-                      of_method.check(self.org))
-        write(self.org, {"extensions/demo-asks/finance-review.lua":
-                         'before "file" { written_for = "demo-asks 1", run = function() while true do end end }\n'})
-        self.install()
-        d = of_method.before(self.org, "demo-asks", "file", {})
-        self.assertEqual(d["decision"], "stop")
-        self.assertIn("stopped by the reader", d["reason"])
-        write(self.org, {"extensions/demo-asks/finance-review.lua":
-                         'before "file" { written_for = "demo-asks 1", run = function() return "maybe" end }\n'})
-        self.install()
-        self.assertIn("no decision", of_method.before(self.org, "demo-asks", "file", {})["reason"])
-
-    def test_a_hook_is_refused_at_install_where_it_cannot_stand(self):
-        for text, said in (('before "remind" { written_for = "demo-asks 1", run = function() end }',
-                            'module "remind" may not be extended'),
-                           ('before "nothing" { written_for = "demo-asks 1", run = function() end }',
-                            'no module "nothing"'),
-                           ('before "file" { written_for = "demo-asks 2", run = function() end }',
-                            'written_for = "demo-asks 1"'),
-                           ('before "file" { written_for = "demo-asks 1" }', "needs run = function")):
-            write(self.org, {"extensions/demo-asks/h.lua": text + "\n"})
-            with self.assertRaisesRegex(bench.BenchError, said):
-                self.install()
+            del os.environ["BENCH_PROBE_SECRET"]
+        self.assertEqual((r["exit"], r["held"]), (0, ["env"]))
+        self.assertTrue(any("a program of the package's own" in x for x in self.logs))
 
 
 class ForkTest(_Project):
