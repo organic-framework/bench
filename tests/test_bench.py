@@ -317,6 +317,32 @@ class ReaderHostileTest(_EachRuntime):
                     'local t = {} for i = 1, 200 do t[i] = string.rep("x", 100000) end return table.concat(t)'):
             self.refused(src)
 
+    def test_memory_in_one_library_call_by_the_ways_round_its_count(self):
+        # of_bench's review, 2026-11-23: a count written as text, format, a join whose values change between reads
+        unpack = "(table.unpack or unpack)"
+        for src in ('return ("x"):rep("500000000")',
+                    'local b = ("x"):rep(8000000) local t = {} for i = 1, 100 do t[i] = b end '
+                    f'return string.format(("%s"):rep(100), {unpack}(t))',
+                    'local b = ("x"):rep(8000000) local o = setmetatable({}, {__tostring = function() return b end}) '
+                    f'local t = {{}} for i = 1, 100 do t[i] = o end return string.format(("%s"):rep(100), {unpack}(t))',
+                    'local b, n = ("x"):rep(8000000), 0 local t = setmetatable({}, {__index = function() n = n + 1 '
+                    'if n % 2 == 1 then return "" end return b end}) '
+                    'return table.concat(t, "", 1, 60)'):
+            self.refused(src)
+
+    def test_a_finalizer_is_not_given(self):
+        # Lua 5.4 runs __gc with every hook off: a finalizer would spend outside the budgets
+        self.refused('for i = 1, 10 do setmetatable({}, {__gc = function() while true do end end}) end return 1')
+
+    def test_a_key_written_twice_is_refused(self):
+        self.refused('return { [1] = "a", ["1"] = "b" }')
+
+    def test_the_library_still_works_within_its_caps(self):
+        for _ in self.each():
+            r = self.read('return { s = string.format("%s=%d %q", "a", 3, "b"), r = ("ab"):rep("3"), '
+                          'c = table.concat({"a", "b"}, ",") }')
+            self.assertEqual(r["returned"], {"s": 'a=3 "b"', "r": "ababab", "c": "a,b"})
+
     def test_a_cycle_or_a_thread_cannot_leave(self):
         for src in ("local t = {} t.t = t return t", "return coroutine.create(function() end)"):
             self.refused(src)
