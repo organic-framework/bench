@@ -180,13 +180,17 @@ def _outer(rt):
         # machine's data as well (/etc/passwd read under it, message 01a20573-1c46). So after it every place that
         # holds the machine's or its people's data is denied (/Volumes and /System/Volumes/Data reach the whole disk,
         # the users' folders included), then the runtime and its keg's lib/ are allowed back. Later rules win.
+        # of_server accepted this for the round (message 01a2057b-28d4); what bsd.sb still allows (reads of the
+        # system's own files, some Mach services) is the stated residual, until a profile listing only what start-up
+        # needs is traced on Darwin 27.
         data = ["/etc", "/private", "/var", "/tmp", "/Users", "/home", "/root", "/Library", "/Applications", "/opt",
                 "/usr/local", "/Volumes", "/System/Volumes/Data", "/Network", "/cores"]
         deny = " ".join(f"(subpath {json.dumps(d)})" for d in data)
         back = [f"(literal {json.dumps(real)})", f"(subpath {json.dumps(prefix + '/lib')})"]
         profile = ('(version 1)\n(import "bsd.sb")\n(deny default)\n'
                    f"(deny file-read* {deny})\n"
-                   '(deny file-write* (subpath "/"))\n(deny network*)\n(deny process-exec*)\n'
+                   '(deny file-write* (subpath "/"))\n(allow file-write-data (literal "/dev/null"))\n'
+                   '(deny network*)\n(deny process-exec*)\n'
                    f"(allow process-exec (literal {json.dumps(real)}))\n"
                    f"(allow file-read* {' '.join(back)})\n"
                    "(allow file-read-metadata)\n(allow sysctl-read)\n")
