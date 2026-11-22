@@ -82,12 +82,14 @@ closed environment, in a Lua process of its own (`bin/bench_sandbox.lua`, run by
 - A file is given its words (`package`, `depends`, …, or the framework's), a `require` that loads only the
   package's own sources, and a short list of the standard library: `string` (no `dump`), `table`, `math`,
   `coroutine`, `pairs`, `pcall` and the like. Not given: `io`, `os`, `load`, `loadstring`, `dofile`, `package`,
-  `debug`, `collectgarbage`, `getfenv`, `setfenv`, LuaJIT's `ffi` and `jit`, and a metatable with `__gc` or
-  `__close` (Lua 5.4 runs those with every hook off). A compiled chunk is refused.
+  `debug`, `collectgarbage`, `getfenv`, `setfenv`, LuaJIT's `ffi` and `jit`, `math.random` and `math.randomseed`,
+  and a metatable with `__gc` or `__close`, then or later (a file's metatable is installed as a copy that refuses
+  them; Lua 5.4 runs a finalizer with every hook off). A compiled chunk is refused.
 - Budgets: a count hook ends the process on its instruction budget (20 million) and its memory budget (64 MiB); a
   library call that would build a string over 8 MiB is refused before it builds it; calls that re-enter Lua from C
   (a gsub callback, a resumed coroutine, a pcall, a sort's comparison) are refused past 40 deep; the process has a
-  ceiling of 256 MiB (the address space on Linux, and on every system a watch on its resident memory that ends it);
+  ceiling of 256 MiB (the address space on Linux, and on every system a watch on the runtime's resident memory, inside
+  the outer layer too, that ends it, and ends it as well when that memory cannot be read);
   the caller ends it on wall time (10 seconds). LuaJIT runs with its compiler off, since compiled code calls no
   hook.
 - What comes back is what Lua returned: a text that is not UTF-8, a whole number or a key past 2^53, and a key
