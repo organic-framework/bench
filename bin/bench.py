@@ -175,19 +175,20 @@ def _outer(rt):
         real = os.path.realpath(rt)
         prefix = os.path.dirname(os.path.dirname(real))   # a Homebrew runtime's keg: its lib/ beside its bin/
         # bsd.sb first: without it no process starts under deny-default on current macOS (of_lab on Darwin 27, message
-        # 01a2056f-f8fc: SIGABRT before main, /bin/echo too). But bsd.sb also opens reads of the machine's files
-        # (/etc/passwd read under it, message 01a20573-1c46), so every file read is denied again after it, and only
-        # what the runtime needs to start is allowed back: an allow-list, not a list of areas to close. Later rules
-        # win in a profile.
-        reads = [real, prefix + "/lib", "/usr/lib", "/System/Library", "/System/Cryptexes",
-                 "/System/Volumes/Preboot/Cryptexes", "/dev/null", "/dev/urandom"]
-        allow = " ".join(f"(subpath {json.dumps(r)})" if not r.startswith("/dev/") and r != real
-                         else f"(literal {json.dumps(r)})" for r in reads)
+        # 01a2056f-f8fc: SIGABRT before main, /bin/echo too). bsd.sb opens reads of system files that dyld needs and
+        # that no short list covers (an allow-list of reads aborts the start too, message 01a20578-7e0d), and of the
+        # machine's data as well (/etc/passwd read under it, message 01a20573-1c46). So after it every place that
+        # holds the machine's or its people's data is denied (/Volumes and /System/Volumes/Data reach the whole disk,
+        # the users' folders included), then the runtime and its keg's lib/ are allowed back. Later rules win.
+        data = ["/etc", "/private", "/var", "/tmp", "/Users", "/home", "/root", "/Library", "/Applications", "/opt",
+                "/usr/local", "/Volumes", "/System/Volumes/Data", "/Network", "/cores"]
+        deny = " ".join(f"(subpath {json.dumps(d)})" for d in data)
+        back = [f"(literal {json.dumps(real)})", f"(subpath {json.dumps(prefix + '/lib')})"]
         profile = ('(version 1)\n(import "bsd.sb")\n(deny default)\n'
-                   '(deny file-read-data (subpath "/"))\n(deny file-write* (subpath "/"))\n(deny network*)\n'
-                   '(deny process-exec*)\n'
+                   f"(deny file-read* {deny})\n"
+                   '(deny file-write* (subpath "/"))\n(deny network*)\n(deny process-exec*)\n'
                    f"(allow process-exec (literal {json.dumps(real)}))\n"
-                   f"(allow file-read-data {allow})\n"
+                   f"(allow file-read* {' '.join(back)})\n"
                    "(allow file-read-metadata)\n(allow sysctl-read)\n")
         return [SANDBOX_EXEC, "-p", profile, real, "-"]
     raise BenchError(f"no outer layer on {sys.platform}: Bench evaluates only inside bwrap (Linux) or sandbox-exec "
