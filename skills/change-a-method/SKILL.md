@@ -12,15 +12,27 @@ change one; take the smallest that does what is wanted:
 2. **Extend** one module with a hook: a file under `extensions/<package>/`.
 3. **Fork** the package: change its own code in `forks/<package>/`, and rebase on each new version.
 
-You need: the organization's project folder (the one with the `Benchfile`; below, the current folder), `of` on the
-machine, and a Lua runtime (`lua5.4`, `luajit` or `lua5.1`). Check them first:
+You need:
+- the organization's project folder, the one with the `Benchfile` (below, the current folder);
+- `of` on the machine, and Bench's checkout where `of owner show` says OF looks for it;
+- a Lua runtime (`lua5.4`, `lua5.5`, `luajit` or `lua5.1`).
+
+Check them first:
 
 ```sh
 ls Benchfile && of bench check
 ```
 
 `of bench check` says "every file matches Benchfile.lock" or names what differs. If it says there is no lock, run
-`of bench install` once.
+`of bench install` once. If it says where it looked for Bench and found none, the machine's owner names the folder
+with `of owner set bench <folder>`; that is not yours to do.
+
+**Where `of bench` can run.** Every `of bench` command reads Lua: the lock, a package's `Benchfile.spec`, your
+settings and hooks. Bench evaluates Lua only inside an operating-system sandbox of its own: `sandbox-exec` on macOS,
+bubblewrap on Linux. On Linux an agent session's own sandbox keeps Bench's from starting, and the command then says
+"the outer layer did not start, so nothing was evaluated". That is no error in your files. Write the files in your
+session, then run the `of bench` commands below in a plain terminal outside it, or ask whoever can. On macOS they
+run from a session too.
 
 ## What the package offers
 
