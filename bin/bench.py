@@ -14,7 +14,9 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -203,7 +205,7 @@ def _outer(rt):
         profile = ('(version 1)\n(import "bsd.sb")\n(deny default)\n'
                    f"(deny file-read* {deny})\n"
                    '(deny file-write* (subpath "/"))\n(allow file-write-data (literal "/dev/null"))\n'
-                   '(deny network*)\n(deny process-exec*)\n'
+                   '(deny network*)\n(deny process-exec*)\n(deny process-fork)\n'
                    f"(allow process-exec (literal {json.dumps(real)}))\n"
                    f"(allow file-read* {' '.join(back)})\n"
                    "(allow file-read-metadata)\n(allow sysctl-read)\n")
@@ -463,9 +465,20 @@ def read_file(path, words, name=None):
     return evaluate({"file.lua": _read_text(path)}, "file.lua", words, name=name or path)
 
 
+def _open_file(p):
+    """P opened for reading as a regular file, never through a link; non-blocking, so a FIFO or a device put in its
+    place is refused without waiting on it (of_server on bench pull request 1), and checked on the open file."""
+    fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        os.close(fd)
+        raise BenchError(f"{p}: not a regular file")
+    return os.fdopen(fd, "rb"), st
+
+
 def _read_text(p):
-    fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    with os.fdopen(fd, "rb") as f:
+    f, _ = _open_file(p)
+    with f:
         data = f.read(FILE_MAX + 1)
     if len(data) > FILE_MAX:
         raise BenchError(f"{p}: over {FILE_MAX} bytes")
@@ -503,9 +516,9 @@ def file_digest(path, mode=False):
     """sha256 of the file's bytes; with MODE, a file that may be executed is marked in the digest too (a package's
     files: a chmod +x is a change)."""
     h = hashlib.sha256()
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    with os.fdopen(fd, "rb") as f:
-        if mode and os.fstat(f.fileno()).st_mode & 0o111:
+    f, st = _open_file(path)
+    with f:
+        if mode and st.st_mode & 0o111:
             h.update(b"executable\0")
         for chunk in iter(lambda: f.read(1 << 16), b""):
             h.update(chunk)
@@ -578,6 +591,18 @@ def _str(v, name, key):
     if not isinstance(v, str) or not v:
         raise BenchError(f"{BENCHFILE}: package \"{name}\": {key} is a text")
     return v
+
+
+# characters HFS+ ignores in a name, as git's own check lists them (utf8.c, is_hfs_dotgit)
+_HFS_IGNORED = dict.fromkeys(map(ord, "\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u206a\u206b"
+                                      "\u206c\u206d\u206e\u206f\ufeff"))
+
+
+def _dotgit(name):
+    """Is NAME, one path component, .git on some file system: any case, HFS's ignored characters, NTFS's trailing
+    dots and spaces, an alternate stream (".git::$INDEX_ALLOCATION"), or its short name git~1?"""
+    n = name.translate(_HFS_IGNORED).lower().split(":", 1)[0].rstrip(". ")
+    return n in (".git", "git~1")
 
 
 def _rel(p, what):
@@ -686,12 +711,27 @@ HOOK_EVENTS = ("applypatch-msg", "commit-msg", "fsmonitor-watchman", "p4-changel
                "update")
 
 
-def _git_env():
+# ssh as git runs it for a fetch or a clone. OpenSSH reads its configuration and keys from the user's home in the
+# password database, not $HOME, so an emptied environment does not keep it from the owner's SSH agent, which a
+# configuration may name (IdentityAgent): the command line closes it, and it takes the first value of each option
+# (of_server on bench pull request 1). A key named in that configuration still works; an agent does not. No prompt.
+SSH = "ssh"
+SSH_OPTIONS = ("-o", "BatchMode=yes", "-o", "IdentityAgent=none", "-o", "IdentitiesOnly=yes")
+
+
+def _git_env(transport=False):
     """git's environment: no system or global configuration (the caller's HOME is not read), no replace objects, no
-    graft file, no lazy fetch, no prompt, and no transport (a fetch opens its own)."""
-    return {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_NO_REPLACE_OBJECTS": "1", "GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0",
-            "GIT_OPTIONAL_LOCKS": "0", "GIT_GRAFT_FILE": "/dev/null", "GIT_ALLOW_PROTOCOL": ""}
+    graft file, no lazy fetch, no prompt, OF_AUTOMATION (an owner's ssh configuration keeps its agent from
+    automation by it), and no transport but with TRANSPORT: https, ssh (without an agent) and file."""
+    env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_NO_LAZY_FETCH": "1",
+           "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "GIT_GRAFT_FILE": "/dev/null",
+           "GIT_ALLOW_PROTOCOL": "", "OF_AUTOMATION": "1"}
+    if transport:
+        env["GIT_ALLOW_PROTOCOL"] = "https:ssh:file"
+        env["GIT_SSH_COMMAND"] = " ".join(shlex.quote(a) for a in (SSH, *SSH_OPTIONS))
+        env["GIT_SSH_VARIANT"] = "ssh"
+    return env
 
 
 def _git_cmd(tree):
@@ -703,16 +743,18 @@ def _git_cmd(tree):
     return [SYSTEM_GIT, "-C", tree, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", *hooks,
             "-c", "diff.external=", "-c", "core.pager=cat", "-c", "protocol.allow=never", "-c", "gc.auto=0",
             "-c", "maintenance.auto=false", "-c", "diff.ignoreSubmodules=none", "-c", "submodule.recurse=false",
-            "-c", "core.commitGraph=false", "-c", "core.alternateRefsCommand="]
+            "-c", "core.commitGraph=false", "-c", "core.alternateRefsCommand=",
+            # what a fetch or a clone takes in is checked, and a tree entry .git in any spelling (its case, HFS's
+            # ignored characters, NTFS's trailing dots and short name) is an error; a checkout writes none either
+            "-c", "transfer.fsckObjects=true", "-c", "fetch.fsck.hasDotgit=error", "-c", "fetch.fsck.hasDot=error",
+            "-c", "fetch.fsck.hasDotdot=error", "-c", "core.protectNTFS=true", "-c", "core.protectHFS=true"]
 
 
 def _git(tree, *args, timeout=300, transport=False, check=True):
     """The system's git with no program the repository names; TRANSPORT opens https, ssh and file for a fetch or a
     clone, which are closed otherwise."""
-    env = _git_env()
-    if transport:
-        env["GIT_ALLOW_PROTOCOL"] = "https:ssh:file"
-    r = subprocess.run(_git_cmd(tree) + list(args), capture_output=True, text=True, timeout=timeout, env=env)
+    r = subprocess.run(_git_cmd(tree) + list(args), capture_output=True, text=True, timeout=timeout,
+                       env=_git_env(transport))
     if check and r.returncode != 0:
         raise BenchError(f"git {args[0]}: {(r.stderr or r.stdout).strip()[:300]}")
     return r
@@ -776,6 +818,8 @@ def export(cache, commit, sub, dest):
         if kind != "blob" or mode not in ("100644", "100755"):
             raise BenchError(f"{path}: a {'link' if mode == '120000' else kind} in a package")
         rel = _rel(rel, "a file of the package")
+        if any(_dotgit(c) for c in rel.split("/")):
+            raise BenchError(f"{path}: a .git path in a package (it would be written out as a live repository)")
         r = subprocess.run(_git_cmd(cache) + ["cat-file", "blob", oid], capture_output=True, timeout=60,
                            env=_git_env())
         if r.returncode != 0:

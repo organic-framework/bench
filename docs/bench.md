@@ -69,11 +69,12 @@ are a framework's, and answer only through one (`of bench …`).
 Linux (no network; fresh user, process, mount and IPC namespaces; a read-only root holding the runtime and the
 libraries it loads, nothing else; no environment) or a deny-by-default sandbox-exec profile on macOS (it may run the
 runtime and read the runtime, its libraries and the system's own files; the machine's and its people's data, writes,
-the network and every other program are denied). On Linux each evaluation also runs in a transient scope of the
-user's systemd manager that bounds its processes (8) and their memory together (512 MiB). When the outer layer cannot start,
-nothing is evaluated and Bench says so. It cannot start inside an agent session's own sandbox, so an agent session
-evaluates nothing: OF's listener evaluates an organization's files, outside sessions (of_server's decision,
-organic-framework-build message `01a20566-e23c`). The inner layer is the closed environment below.
+the network, a new process and every other program are denied). On Linux each evaluation also runs in a transient
+scope of the user's systemd manager that bounds its processes (8) and their memory together (512 MiB). When the outer
+layer cannot start, nothing is evaluated and Bench says so. It cannot start inside an agent session's own sandbox,
+so an agent session evaluates nothing: OF's listener evaluates an organization's files, outside sessions
+(of_server's decision, organic-framework-build message `01a20566-e23c`). The inner layer is the closed environment
+below.
 
 Every Lua file Bench reads (a Benchfile, a spec, the lock), and every file a framework hands it, is evaluated in a
 closed environment, in a Lua process of its own (`bin/bench_sandbox.lua`, run by `bin/bench.py`):
@@ -126,13 +127,20 @@ new content. The tests do not forbid a change; they show which of the package's 
 version still keeps. A rebase commits under the person's own git name and address, without signing.
 
 **A package's tests are its own program.** After a rebase they are the new upstream's. Bench runs them as an
-ordinary process, outside the reader, and says so before it does; they get only a short environment (`PATH`, `HOME`,
-the user and language, `TMPDIR`, `OF_HOME`, `BENCH_HOME`), never the rest, where a token or an agent's socket may
-be. `bench rebase --no-tests` rebases without running them.
+ordinary process, outside the reader and outside any sandbox, and says so before it does: they can read every file
+the person running them can, and write wherever that person can, keys and tokens in files included. They get only
+a short environment (`PATH`, `HOME`, the user and language, `TMPDIR`, `OF_HOME`, `BENCH_HOME`), never the rest,
+where a token or an agent's socket may be; that keeps what the environment carries from them, not what the disk
+holds. Run them only for a package whose source you trust, or `bench rebase --no-tests`, which rebases without
+running them.
 
 Every git call Bench makes runs the system's git with no program a package's repository names: no hooks, no
 fsmonitor, no external diff or pager, no automatic maintenance, no global or system configuration, and transports
-opened only for a fetch or a clone.
+opened only for a fetch or a clone. Over ssh it reaches no SSH agent and asks nothing (`IdentityAgent=none`,
+`IdentitiesOnly=yes`, `BatchMode=yes` on ssh's command line, which comes before its configuration): a key that
+configuration names works, an agent does not. What a fetch or a clone takes in is checked (`transfer.fsckObjects`),
+and a tree entry `.git` in any spelling is an error there and is refused again when a package's files are written
+out, so no package arrives as a live repository.
 
 ## A framework on Bench
 
