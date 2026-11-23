@@ -632,6 +632,83 @@ class LockTest(_Project):
         with self.assertRaisesRegex(bench.BenchError, "main.lua changed since the lock"):
             self.install(frozen=True)
 
+    # of_server on bench pull request 1: a tree entry .git, in any spelling, would be written out as a live repository
+    def _crafted(self, name):
+        """A commit on the upstream's main whose tree holds NAME/config, a git configuration that runs a program."""
+        blob = subprocess.run(["git", "-C", self.upstream, "hash-object", "-w", "--stdin"], input="[core]\n"
+                              "\tfsmonitor = touch /tmp/bench-crafted\n", capture_output=True, text=True,
+                              check=True).stdout.strip()
+        mk = lambda line: subprocess.run(["git", "-C", self.upstream, "mktree"], input=line, capture_output=True,
+                                         text=True, check=True).stdout.strip()
+        inner = mk(f"100644 blob {blob}\tconfig\n")
+        base = git(self.upstream, "rev-parse", "HEAD^{tree}")
+        top = mk(subprocess.run(["git", "-C", self.upstream, "ls-tree", base], capture_output=True, text=True,
+                                check=True).stdout + f"040000 tree {inner}\t{name}\n")
+        c = git(self.upstream, "commit-tree", "-p", "HEAD", "-m", "crafted", top)
+        git(self.upstream, "update-ref", "refs/heads/main", c)
+        return c
+
+    def test_a_dotgit_tree_entry_is_refused_on_fetch(self):
+        for name in (".GIT", "git~1", ".git.", ".g\u200cit"):
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                self._crafted(name)
+                with self.assertRaisesRegex(bench.BenchError, "git fetch"):
+                    self.install()
+
+    def test_a_dotgit_path_is_refused_in_export(self):
+        # a cache filled before the fetch checked objects: export refuses the path itself
+        c = self._crafted(".Git")
+        cache = os.path.join(self.tmp, "cache.git")
+        subprocess.run(["git", "clone", "-q", "--bare", self.upstream, cache], check=True, capture_output=True)
+        with self.assertRaisesRegex(bench.BenchError, "a .git path in a package"):
+            bench.export(cache, c, None, os.path.join(self.tmp, "out"))
+        for n in (".git", ".GIT", "git~1", "GIT~1", ".git.", ".git ", ".git::$INDEX_ALLOCATION", ".g\u200cit",
+                  "\ufeff.git"):
+            self.assertTrue(bench._dotgit(n), n)
+        for n in (".github", "git", ".gitignore", "x.git", "git~2"):
+            self.assertFalse(bench._dotgit(n), n)
+
+    def test_a_fetch_over_ssh_reaches_no_ssh_agent(self):
+        # OpenSSH reads its configuration from the password database's home, so the command line must close the
+        # agent: the ssh git runs is recorded, with its arguments and its environment
+        rec = os.path.join(self.tmp, "ssh-rec")
+        with open(rec, "w") as f:
+            f.write(f'#!/bin/sh\nprintf "%s\\n" "$@" > {self.tmp}/ssh-argv\nenv > {self.tmp}/ssh-env\nexit 1\n')
+        os.chmod(rec, 0o755)
+        write(self.org, {"Benchfile": 'package("demo-asks", { git = "ssh://git@example.invalid/demo-asks", '
+                                      'ref = "main" })\n'})
+        saved, sock = bench.SSH, os.environ.get("SSH_AUTH_SOCK")
+        bench.SSH, os.environ["SSH_AUTH_SOCK"] = rec, os.path.join(self.tmp, "agent.sock")
+        try:
+            with self.assertRaises(bench.BenchError):
+                self.install()
+        finally:
+            bench.SSH = saved
+            if sock is None:
+                os.environ.pop("SSH_AUTH_SOCK", None)
+            else:
+                os.environ["SSH_AUTH_SOCK"] = sock
+        with open(os.path.join(self.tmp, "ssh-argv")) as f:
+            argv = f.read().split("\n")
+        host = next(i for i, a in enumerate(argv) if "example.invalid" in a)
+        for opt in ("BatchMode=yes", "IdentityAgent=none", "IdentitiesOnly=yes"):
+            self.assertIn(opt, argv[:host])
+        with open(os.path.join(self.tmp, "ssh-env")) as f:
+            env = dict(line.split("=", 1) for line in f.read().splitlines() if "=" in line)
+        self.assertNotIn("SSH_AUTH_SOCK", env)
+        self.assertEqual(env.get("OF_AUTOMATION"), "1")
+        self.assertEqual(env.get("HOME"), "/nonexistent")
+
+    def test_a_fifo_in_place_of_a_file_is_refused_without_waiting(self):
+        p = os.path.join(self.tmp, "Benchfile.lock")
+        os.mkfifo(p)
+        with self.assertRaisesRegex(bench.BenchError, "not a regular file"):
+            bench._read_text(p)
+        with self.assertRaisesRegex(bench.BenchError, "not a regular file"):
+            bench.file_digest(p)
+
     def test_a_link_in_a_package_is_refused(self):
         os.symlink("/etc/hosts", os.path.join(self.upstream, "hosts"))
         git(self.upstream, "add", "hosts")
