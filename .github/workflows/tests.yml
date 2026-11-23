@@ -13,9 +13,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
-      # the reader is checked on every runtime it takes: Lua 5.4, LuaJIT and Lua 5.1; a test that finds none fails
+      # the reader is checked on every runtime it takes: Lua 5.4, Lua 5.5, LuaJIT and Lua 5.1; a test that finds none
+      # fails
       - name: Install Lua
         run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends lua5.4 luajit lua5.1
+      # Ubuntu 24.04 has no Lua 5.5: it is built from the Lua team's repository at the commit of its tag v5.5.1 (the
+      # hash is the check of what is built), as one plain interpreter, without that repository's test library
+      - name: Build Lua 5.5
+        run: |
+          git init -q "$RUNNER_TEMP/lua55" && cd "$RUNNER_TEMP/lua55"
+          git fetch -q --depth 1 https://github.com/lua/lua 7579fc9d7ed90240487251dfb69168f8e64e9294
+          git checkout -q FETCH_HEAD
+          cc -std=c99 -O2 -DLUA_USE_LINUX -DMAKE_LUA -o lua5.5 onelua.c -lm -ldl
+          sudo install -m 755 lua5.5 /usr/local/bin/lua5.5
+          lua5.5 -v
       # the outer layer every evaluation runs in (docs/bench.md): bwrap, which Ubuntu 24.04's AppArmor keeps from
       # making user namespaces until this is lifted; in CI its tests must run, never skip
       - name: Install bwrap

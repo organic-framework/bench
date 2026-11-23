@@ -12,9 +12,9 @@ programs (they are shown at install).
 
 ## Setting it up
 
-Bench needs Python 3, git (`/usr/bin/git`) and a Lua runtime: Lua 5.4, LuaJIT 2.1 or Lua 5.1, whatever the program
-is named (Lua 5.2 and 5.3 are refused). On macOS `brew install luajit`; on Debian or Ubuntu `apt install lua5.4`;
-on Arch `pacman -S lua`. Clone this repository; the command is `bin/bench`.
+Bench needs Python 3, git (`/usr/bin/git`) and a Lua runtime: Lua 5.4, Lua 5.5, LuaJIT 2.1 or Lua 5.1, whatever the
+program is named (Lua 5.2 and 5.3 are refused). On macOS `brew install luajit`; on Debian or Ubuntu
+`apt install lua5.4`; on Arch `pacman -S lua`. Clone this repository; the command is `bin/bench`.
 
 ## A project
 
@@ -86,7 +86,8 @@ closed environment, in a Lua process of its own (`bin/bench_sandbox.lua`, run by
   `coroutine`, `pairs`, `pcall` and the like. Not given: `io`, `os`, `load`, `loadstring`, `dofile`, `package`,
   `debug`, `collectgarbage`, `getfenv`, `setfenv`, LuaJIT's `ffi` and `jit`, `math.random` and `math.randomseed`,
   and a metatable with `__gc` or `__close`, then or later (a file's metatable is installed as a copy that refuses
-  them; Lua 5.4 runs a finalizer with every hook off). A compiled chunk is refused.
+  them; Lua 5.4 and 5.5 run a finalizer with every hook off). A compiled chunk is refused. On Lua 5.5 a `global`
+  declaration names the file's own environment, and `table.create` is not given.
 - Budgets: a count hook ends the process on its instruction budget (20 million) and its memory budget (64 MiB); a
   library call that would build a string over 8 MiB is refused before it builds it; calls that re-enter Lua from C
   (a gsub callback, a resumed coroutine, a pcall, a sort's comparison) are refused past 40 deep; the process has a
@@ -102,7 +103,7 @@ closed environment, in a Lua process of its own (`bin/bench_sandbox.lua`, run by
 - A name that is not a word of the file is an error, so a misspelt word is caught at install.
 
 The hostile set, one test per case (`tests/test_bench.py`, `ReaderHostileTest`), runs on every runtime the machine
-has; CI runs it on Lua 5.4, LuaJIT and Lua 5.1 and fails without them.
+has; CI runs it on Lua 5.4, Lua 5.5, LuaJIT and Lua 5.1 and fails without them.
 
 ## The lock
 

@@ -60,7 +60,8 @@ FILE_MAX = 1024 * 1024          # one Lua source
 SOURCES_MAX = 8 * 1024 * 1024   # all the Lua sources of one package
 
 # the Lua runtimes the reader runs on, the first found; LuaJIT runs with its compiler off (the hook needs that)
-RUNTIMES = ("lua5.4", "lua54", "lua", "luajit", "lua5.1")
+RUNTIMES = ("lua5.4", "lua54", "lua5.5", "lua55", "lua", "luajit", "lua5.1")
+VERSIONS = ("Lua 5.1", "Lua 5.4", "Lua 5.5")   # what a runtime says it is (LuaJIT says "Lua 5.1")
 RUNTIME_DIRS = ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "/bin")
 
 NAME = re.compile(r"[a-z][a-z0-9_-]{0,63}")
@@ -87,7 +88,7 @@ _VERSIONS = {}
 
 
 def _version(p):
-    """What the runtime at P says it is: "Lua 5.1" (LuaJIT says so too), "Lua 5.4", or another."""
+    """What the runtime at P says it is: "Lua 5.1" (LuaJIT says so too), "Lua 5.4", "Lua 5.5", or another."""
     if p not in _VERSIONS:
         try:
             r = subprocess.run([p, "-e", "io.write(_VERSION)"], capture_output=True, text=True, timeout=10,
@@ -99,14 +100,15 @@ def _version(p):
 
 
 def runtime():
-    """The Lua runtime this machine has, as an absolute path: Lua 5.4, LuaJIT or Lua 5.1, whatever its name. Lua 5.2
-    and 5.3 are refused: the reader is checked on 5.1 and 5.4 only (their finalizers and C calls differ)."""
+    """The Lua runtime this machine has, as an absolute path: Lua 5.4, Lua 5.5, LuaJIT or Lua 5.1, whatever its name.
+    Lua 5.2 and 5.3 are refused: the reader is checked on 5.1, 5.4 and 5.5 only (their finalizers and C calls
+    differ)."""
     for name in RUNTIMES:
         for d in RUNTIME_DIRS:
             p = os.path.join(d, name)
-            if os.path.isfile(p) and os.access(p, os.X_OK) and _version(p) in ("Lua 5.1", "Lua 5.4"):
+            if os.path.isfile(p) and os.access(p, os.X_OK) and _version(p) in VERSIONS:
                 return p
-    raise BenchError("no Lua runtime on this machine: Bench reads with lua 5.4, LuaJIT or lua 5.1 "
+    raise BenchError("no Lua runtime on this machine: Bench reads with lua 5.4, lua 5.5, LuaJIT or lua 5.1 "
                      "(macOS: brew install luajit; Debian or Ubuntu: apt install lua5.4)")
 
 

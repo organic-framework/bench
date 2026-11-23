@@ -1,7 +1,8 @@
 """Bench's first slice (docs/bench.md; organic-framework-build reports/framework/metamethod/11-first-slice.md):
 the closed reader (part 1, with its hostile set), the lock (part 2), settings and a hook before a module as OF reads
 them (the mechanisms parts 4 and 5 need), and a fork with a rebase (part 6). Every reader test runs on each Lua
-runtime this machine has; in CI that is Lua 5.4 and LuaJIT, and no runtime there is a failure, not a skip."""
+runtime this machine has; in CI that is Lua 5.4, Lua 5.5, LuaJIT and Lua 5.1, and no runtime there is a failure,
+not a skip."""
 
 import os
 import shutil
@@ -30,14 +31,14 @@ FAST = {"instructions": 2_000_000}
 
 def runtimes():
     found = []
-    for name in ("lua5.4", "luajit", "lua5.1"):
+    for name in ("lua5.4", "lua5.5", "luajit", "lua5.1"):
         for d in bench.RUNTIME_DIRS:
             p = os.path.join(d, name)
             if os.path.isfile(p) and p not in found:
                 found.append(p)
                 break
     if not found and os.environ.get("CI"):
-        raise AssertionError("no Lua runtime in CI: the unit job installs lua5.4 and luajit")
+        raise AssertionError("no Lua runtime in CI: the unit job installs lua5.4, lua5.5, luajit and lua5.1")
     return found
 
 
@@ -242,6 +243,27 @@ class ReaderHostileTest(_EachRuntime):
             with self.assertRaises(bench.Stopped) as cm:
                 self.read(src, **kw)
             self.assertEqual(cm.exception.reason, reason)
+
+    # Lua 5.5's own: a global declaration names the file's environment, never the runner's; table.create, one call
+    # that would allocate past the memory budget's next check, is not given
+    def test_lua_5_5s_global_declarations_and_table_create(self):
+        ran = False
+        for rt in self.each():
+            if bench._version(rt) != "Lua 5.5":
+                continue
+            ran = True
+            for src in ("global io; return io.open('/etc/hosts')", "global *; return os.getenv('HOME')",
+                        "global <const> debug; return debug.getinfo(1)", "global function f() return 1 end",
+                        "return _ENV.io"):
+                with self.assertRaisesRegex(bench.BenchError, "unknown name"):
+                    self.read(src)
+            with self.assertRaises(bench.BenchError):
+                self.read("return table.create(2^31)")
+            self.assertEqual(self.read("return table.create == nil")["returned"], True)
+        if not ran:
+            if os.environ.get("CI"):
+                self.fail("no Lua 5.5 in CI")
+            self.skipTest("no Lua 5.5 on this machine")
 
     # reading a file
     def test_reading_a_file(self):
@@ -475,14 +497,15 @@ class ReaderHostileTest(_EachRuntime):
             bench._limits = saved
 
     def test_CI_runs_every_runtime(self):
-        # in CI the hostile set must run on Lua 5.4, LuaJIT and Lua 5.1 (of_server, message 01a20547-5da1), never skip
+        # in CI the hostile set must run on Lua 5.4, LuaJIT and Lua 5.1 (of_server, message 01a20547-5da1) and Lua 5.5
+        # (the founder, prompt 01a2079b-ff0a, through of_conductor), never skip
         if not os.environ.get("CI"):
             self.skipTest("CI only")
-        self.assertEqual(sorted(os.path.basename(r) for r in runtimes()), ["lua5.1", "lua5.4", "luajit"])
+        self.assertEqual(sorted(os.path.basename(r) for r in runtimes()), ["lua5.1", "lua5.4", "lua5.5", "luajit"])
 
-    def test_only_lua_5_1_and_5_4_are_taken(self):
+    def test_only_lua_5_1_5_4_and_5_5_are_taken(self):
         for rt in runtimes():
-            self.assertIn(bench._version(rt), ("Lua 5.1", "Lua 5.4"))
+            self.assertIn(bench._version(rt), ("Lua 5.1", "Lua 5.4", "Lua 5.5"))
 
     def test_a_cycle_or_a_thread_cannot_leave(self):
         for src in ("local t = {} t.t = t return t", "return coroutine.create(function() end)"):
