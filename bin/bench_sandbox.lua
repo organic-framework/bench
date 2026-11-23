@@ -8,7 +8,7 @@
 -- string.dump, LuaJIT's ffi and jit. A count hook ends the process on its instruction budget and on its memory
 -- budget, and the caller ends it on wall time.
 --
--- Runs on Lua 5.1, 5.4 and LuaJIT 2.1.
+-- Runs on Lua 5.1, 5.4, 5.5 and LuaJIT 2.1.
 
 -- ---- what the runner keeps for itself, before any file runs ----
 local type, next, pairs, ipairs, select, error, pcall = type, next, pairs, ipairs, select, error, pcall
@@ -289,7 +289,7 @@ local function sandbox_require(name)
   return r
 end
 
--- setmetatable without finalizers or to-be-closed values: Lua 5.4 runs a __gc with every hook off, and reads __close
+-- setmetatable without finalizers or to-be-closed values: Lua 5.4 and 5.5 run a __gc with every hook off, and read __close
 -- when a variable is declared, so a metatable must not hold them then or later (of_server, message 01a20573-e987). A
 -- file's metatable is installed as a copy that refuses those two keys afterwards (its own __newindex; rawset is
 -- guarded too); a later change to the table the file passed does not reach the copy.
